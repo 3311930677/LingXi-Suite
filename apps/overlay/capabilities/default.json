@@ -1,8 +1,8 @@
 {
-  "$schema": "../gen/schemas/desktop-schema.json",
+  "`$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Permissions for the overlay window.",
-  "windows": ["main", "pet", "widget-ocr", "widget-translate", "widget-colorpicker", "widget-weather", "widget-calculator", "widget-clipboard"],
+  "description": "Permissions for the pet window (local boot page).",
+  "windows": ["pet"],
   "permissions": [
     "core:default",
     "core:event:default",

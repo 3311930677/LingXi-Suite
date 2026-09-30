@@ -256,7 +256,8 @@ pub fn skin_dir(id: &str) -> Option<PathBuf> {
 }
 
 /// 皮肤内文件 → 前端可直显 URL：
-/// 内置皮肤返回相对 `ui/` 的路径（webview 根即 ui/）；
+/// 内置皮肤返回引擎侧根相对路径（桌宠前端由引擎 `/pet` 服务加载，
+/// 资产经 `/pet-assets` 挂载自 overlay 的 `ui/assets/skins`）；
 /// 用户皮肤返回 asset protocol URL（需 tauri.conf.json 开启 assetProtocol）。
 pub fn skin_file_url(source: &str, skin_id: &str, file_name: &str) -> String {
     if source == SKIN_SOURCE_USER {
@@ -264,7 +265,7 @@ pub fn skin_file_url(source: &str, skin_id: &str, file_name: &str) -> String {
             return asset_url(&path);
         }
     }
-    format!("assets/skins/{skin_id}/{file_name}")
+    format!("/pet-assets/skins/{skin_id}/{file_name}")
 }
 
 /// Windows asset protocol URL：`http://asset.localhost/<encodeURIComponent(path)>`。

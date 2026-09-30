@@ -1,7 +1,6 @@
-//! 托盘图标与菜单：面板显示/隐藏、打开工作台、退出。
+//! 托盘图标与菜单：桌宠显隐、打开工作台、退出。
 //!
-//! 桌宠定位为「引擎进度控制台」，与工作台重复的入口（小工具子菜单等）
-//! 已移除；工作台通过菜单或桌宠单击打开。
+//! 桌宠定位为「agent 的显示工具板块」——托盘只保留与该定位相关的最小入口。
 
 use tauri::{
     menu::{Menu, MenuItem, PredefinedMenuItem},
@@ -9,45 +8,41 @@ use tauri::{
     AppHandle, Manager,
 };
 
-use crate::state::MutexExt;
+use crate::pet;
+use crate::state::{AppState, MutexExt};
 
 pub(crate) fn install_tray(app: &AppHandle) -> tauri::Result<()> {
-    eprintln!("[lingxi] install_tray: creating menu...");
-    let show_panel = MenuItem::with_id(app, "tray:show", "显示面板", true, None::<&str>)?;
-    let hide_panel = MenuItem::with_id(app, "tray:hide", "隐藏面板", true, None::<&str>)?;
+    let show_pet = MenuItem::with_id(app, "tray:show-pet", "显示桌宠", true, None::<&str>)?;
+    let hide_pet = MenuItem::with_id(app, "tray:hide-pet", "隐藏桌宠", true, None::<&str>)?;
     let workbench = MenuItem::with_id(app, "tray:workbench", "打开工作台", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, "tray:quit", "退出灵犀", true, None::<&str>)?;
     let separator = PredefinedMenuItem::separator(app)?;
     let menu = Menu::with_items(
         app,
-        &[&show_panel, &hide_panel, &separator, &workbench, &separator, &quit],
+        &[&show_pet, &hide_pet, &separator, &workbench, &separator, &quit],
     )?;
-    eprintln!("[lingxi] install_tray: menu created, getting icon...");
     let icon = app
         .default_window_icon()
         .cloned()
         .ok_or_else(|| tauri::Error::AssetNotFound("default window icon".into()))?;
-    eprintln!("[lingxi] install_tray: icon ok, building tray...");
     let _tray = TrayIconBuilder::with_id("lingxi-tray")
         .icon(icon)
-        .tooltip("灵犀 · L3 跨应用 AI 助手")
+        .tooltip("灵犀 · 引擎进度桌宠")
         .menu(&menu)
         .show_menu_on_left_click(false)
         .on_menu_event(|app, event| match event.id.as_ref() {
-            "tray:show" => {
-                if let Some(window) = app.get_webview_window("main") {
-                    let _ = window.show();
-                }
+            "tray:show-pet" => {
+                let state = app.state::<AppState>();
+                let _ = pet::set_pet_visible_inner(app, &state, true);
             }
-            "tray:hide" => {
-                if let Some(window) = app.get_webview_window("main") {
-                    let _ = window.hide();
-                }
+            "tray:hide-pet" => {
+                let state = app.state::<AppState>();
+                let _ = pet::set_pet_visible_inner(app, &state, false);
             }
             "tray:workbench" => {
-                // A8-2：打开 OwO Agent 工作台（与桌宠单击/右键菜单同一入口）。
+                // 与桌宠单击菜单同一入口：打开 OwO Agent 工作台。
                 let port = app
-                    .state::<crate::state::AppState>()
+                    .state::<AppState>()
                     .backend
                     .safe_lock()
                     .owo_agent_port;
@@ -61,18 +56,6 @@ pub(crate) fn install_tray(app: &AppHandle) -> tauri::Result<()> {
             }
             _ => {}
         })
-        .on_tray_icon_event(|tray, event| {
-            if let tauri::tray::TrayIconEvent::DoubleClick { .. } = event {
-                if let Some(window) = tray.app_handle().get_webview_window("main") {
-                    if window.is_visible().unwrap_or(false) {
-                        let _ = window.hide();
-                    } else {
-                        let _ = window.show();
-                    }
-                }
-            }
-        })
         .build(app)?;
-    eprintln!("[lingxi] install_tray: tray built successfully");
     Ok(())
 }

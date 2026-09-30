@@ -1,0 +1,14 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "pet-remote",
+  "description": "桌宠窗口加载引擎服务的远程页面（/pet/index.html）：授权该来源使用 Tauri IPC（invoke 走原生桥：移动窗口/审批/中止/显隐等）。",
+  "windows": ["pet"],
+  "remote": {
+    "urls": ["http://127.0.0.1:*", "http://localhost:*"]
+  },
+  "permissions": [
+    "core:default",
+    "core:event:default",
+    "core:window:default"
+  ]
+}

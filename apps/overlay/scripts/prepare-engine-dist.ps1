@@ -9,7 +9,9 @@
 # BOM-less UTF-8 scripts containing non-ASCII characters.
 param(
     [ValidateSet("release", "debug")]
-    [string]$Profile = "release"
+    [string]$Profile = "release",
+    # Set to $true to skip stopping a running engine (then engine-dist copy may fail with os error 32).
+    [switch]$KeepEngineRunning
 )
 
 $ErrorActionPreference = "Stop"
@@ -29,6 +31,18 @@ if (-not (Test-Path $engineExe)) {
 $distDir = Join-Path $overlayDir "engine-dist"
 New-Item -ItemType Directory -Force -Path $distDir | Out-Null
 $target = Join-Path $distDir "owo-agent.exe"
+
+# A running engine locks the destination (and tauri's build script copies this
+# file too - os error 32). Stop it unless explicitly kept alive.
+if (-not $KeepEngineRunning) {
+    $running = Get-Process owo-agent -ErrorAction SilentlyContinue
+    if ($running) {
+        Write-Host "Stopping running owo-agent (pid $($running.Id -join ',')) to unlock engine-dist..."
+        $running | Stop-Process -Force -ErrorAction SilentlyContinue
+        Start-Sleep -Seconds 2
+    }
+}
+
 Copy-Item -Force $engineExe $target
 $sizeMb = [math]::Round((Get-Item $target).Length / 1MB, 1)
 Write-Host "Ready: $target ($sizeMb MB, from $Profile)"

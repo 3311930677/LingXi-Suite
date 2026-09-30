@@ -12,42 +12,6 @@ use windows::Win32::UI::WindowsAndMessaging::GetCursorPos;
 
 use crate::state::{AppState, MutexExt};
 use crate::window_state;
-/// Position the overlay near the cursor, fully inside the work area of the
-/// monitor under the cursor. Config `center: true` is unreliable for a
-/// transparent, borderless window (its size isn't settled at creation), so we
-/// place it explicitly on every show. Win32 (physical px), the monitor work
-/// area, and Tauri's PhysicalPosition all agree under per-monitor DPI.
-pub(crate) fn position_overlay(app: &AppHandle, window: &WebviewWindow) {
-    let mut cursor = POINT::default();
-    // SAFETY: GetCursorPos writes the current cursor position into `cursor`.
-    if unsafe { GetCursorPos(&mut cursor) }.is_err() {
-        let _ = window.center();
-        return;
-    }
-
-    // SAFETY: MonitorFromPoint always returns a valid monitor with NEAREST.
-    let monitor = unsafe { MonitorFromPoint(cursor, MONITOR_DEFAULTTONEAREST) };
-    let mut info = MONITORINFO {
-        cbSize: std::mem::size_of::<MONITORINFO>() as u32,
-        ..Default::default()
-    };
-    // SAFETY: `info.cbSize` is set as required by GetMonitorInfoW.
-    if !unsafe { GetMonitorInfoW(monitor, &mut info) }.as_bool() {
-        let _ = window.center();
-        return;
-    }
-
-    let work = info.rcWork;
-    let size = window.outer_size().unwrap_or(PhysicalSize::new(520, 520));
-    let w = size.width as i32;
-    let h = size.height as i32;
-
-    // Offset a little from the caret so the panel doesn't cover it, then clamp
-    // the whole window inside the work area.
-    let x = (cursor.x + 24).min(work.right - w).max(work.left);
-    let y = (cursor.y + 24).min(work.bottom - h).max(work.top);
-    set_position_tracked(app, window, x, y);
-}
 
 pub(crate) fn position_pet(app: &AppHandle, window: &WebviewWindow) {
     // Place the whole pet inside the monitor work area (excluding taskbar).
@@ -109,10 +73,7 @@ pub(crate) fn handle_window_moved(app: &AppHandle, label: &str, pos: PhysicalPos
     }
     let mut windows = state.window_state.safe_lock();
     let entry = window_state::WindowPos { x: pos.x, y: pos.y };
-    if label == "main" {
-        windows.panel = Some(entry);
-        state.user_positioned.store(true, Ordering::Relaxed);
-    } else {
+    if label == "pet" {
         windows.pet = Some(entry);
     }
     drop(windows);

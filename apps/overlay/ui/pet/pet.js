@@ -13,10 +13,10 @@ const skinMenu = document.getElementById("skin-menu");
 // 浏览器预览回落：Tauri 后端不可用时仍能显示默认皮肤。
 const FALLBACK = {
   images: {
-    idle: "assets/skins/lingxi-hamster/idle.png",
-    thinking: "assets/skins/lingxi-hamster/thinking.png",
-    speaking: "assets/skins/lingxi-hamster/speaking.png",
-    alert: "assets/skins/lingxi-hamster/alert.png",
+    idle: "/pet-assets/skins/lingxi-hamster/idle.png",
+    thinking: "/pet-assets/skins/lingxi-hamster/thinking.png",
+    speaking: "/pet-assets/skins/lingxi-hamster/speaking.png",
+    alert: "/pet-assets/skins/lingxi-hamster/alert.png",
   },
   anims: null,
   frame: null,
@@ -516,32 +516,35 @@ function petted() {
   sayTemp(pick(lines));
 }
 
-/// A8-2：轮询引擎活跃回合快照——桌宠的进度/审批都来自这里
-/// （引擎空闲或未启动时静默；气泡回落事件驱动的本地状态）。
+/// 引擎活跃回合快照 → 桌宠气泡与状态（数据来自 Rust worker 推送或兜底轮询）。
+function applyActivity(data) {
+  activitySnapshot = {
+    active: Array.isArray(data && data.active) ? data.active : [],
+    pending_approvals: Number((data && data.pending_approvals) || 0),
+  };
+  const head = (activitySnapshot.active || [])[0];
+  if (!head) return;
+  // 气泡跟随引擎侧进度（工作台/引擎侧任务都会出现在这里）。
+  if (!sayActive) {
+    const label = PHASE_LABEL[head.phase] || head.phase || "运行中";
+    bubble.textContent = head.tool ? `${label}：${head.tool}` : label;
+  }
+  if (head.phase === "waiting_approval") render("alert");
+  else if (head.phase === "speaking" || head.phase === "tool") render("speaking");
+  else render("thinking");
+}
+
+/// 阶段 3 兜底轮询：主通道是 Rust worker 的 `owo://activity` 事件推送
+/// （内容变化才发、不依赖前端定时器），这里仅低频兜底（webview 节流无妨）。
 async function pollActivity() {
   if (!invoke) return;
-  // A8-3：桌宠显隐双向同步（工作台开关 → 桌宠；本机切换 → 上报引擎）。
   try {
     await invoke("owo_pet_sync");
   } catch {
     /* 引擎未启动：保持本机状态 */
   }
   try {
-    const data = await invoke("owo_activity");
-    activitySnapshot = {
-      active: Array.isArray(data && data.active) ? data.active : [],
-      pending_approvals: Number((data && data.pending_approvals) || 0),
-    };
-    const head = (activitySnapshot.active || [])[0];
-    if (!head) return;
-    // 气泡跟随引擎侧进度（工作台/面板的回合都会出现在这里）。
-    if (!sayActive) {
-      const label = PHASE_LABEL[head.phase] || head.phase || "运行中";
-      bubble.textContent = head.tool ? `${label}：${head.tool}` : label;
-    }
-    if (head.phase === "waiting_approval") render("alert");
-    else if (head.phase === "speaking" || head.phase === "tool") render("speaking");
-    else render("thinking");
+    applyActivity(await invoke("owo_activity"));
   } catch {
     /* 引擎未启动/短暂不可达：保持现状 */
   }
@@ -563,7 +566,7 @@ if (invoke) {
     }
   })();
   pollActivity();
-  setInterval(pollActivity, 2500);
+  setInterval(pollActivity, 10000);
 }
 if (listen) {
   listen("pet-config-changed", (event) => applyConfig(event.payload)).catch(() => {});
@@ -571,5 +574,9 @@ if (listen) {
   listen("owo://pet-status", (event) => {
     const next = event && event.payload ? event.payload.status : "";
     if (typeof next === "string" && next) render(next);
+  }).catch(() => {});
+  // 阶段 3 主通道：Rust worker 的进度快照推送（内容变化才发）。
+  listen("owo://activity", (event) => {
+    if (event && event.payload) applyActivity(event.payload);
   }).catch(() => {});
 }

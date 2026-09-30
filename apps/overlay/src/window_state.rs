@@ -16,9 +16,8 @@ pub struct WindowPos {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct WindowState {
-    /// 用户拖动后的主面板位置（None = 从未拖动，保持跟随光标）。
-    pub panel: Option<WindowPos>,
     /// 用户拖动后的桌宠位置（None = 使用默认右下角）。
+    /// 旧版本文件的 panel 字段经 serde 忽略平滑遗忘。
     pub pet: Option<WindowPos>,
 }
 

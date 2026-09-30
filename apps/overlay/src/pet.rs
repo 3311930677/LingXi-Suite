@@ -75,11 +75,10 @@ pub(crate) fn set_pet_status(
     Ok(())
 }
 
-/// 面板按钮：显示/隐藏桌宠（不改动气泡覆盖与其他设置）。
-#[tauri::command]
-pub(crate) fn set_pet_visible(
-    app: AppHandle,
-    state: State<AppState>,
+/// 显示/隐藏桌宠的统一入口（命令与托盘菜单共用）。
+pub(crate) fn set_pet_visible_inner(
+    app: &AppHandle,
+    state: &AppState,
     visible: bool,
 ) -> Result<(), String> {
     let (skin_id, overrides) = {
@@ -102,6 +101,16 @@ pub(crate) fn set_pet_visible(
         let _ = app.emit("pet-config-changed", &view);
     }
     Ok(())
+}
+
+/// 显示/隐藏桌宠（不改动气泡覆盖与其他设置）。
+#[tauri::command]
+pub(crate) fn set_pet_visible(
+    app: AppHandle,
+    state: State<AppState>,
+    visible: bool,
+) -> Result<(), String> {
+    set_pet_visible_inner(&app, &state, visible)
 }
 
 /// 设置页：列出全部可用皮肤。

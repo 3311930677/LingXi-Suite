@@ -1,0 +1,22 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <title>灵犀桌宠 · 连接中</title>
+    <style>
+      body { margin: 0; background: transparent; overflow: hidden; font-family: system-ui, "Microsoft YaHei", sans-serif; }
+      .wrap { display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100vh; gap: 8px; }
+      img { width: 132px; image-rendering: pixelated; animation: breathe 2.4s ease-in-out infinite; }
+      .tip { font-size: 12px; color: #8a8a94; background: rgba(30,30,34,.86); padding: 4px 12px; border-radius: 12px; }
+      @keyframes breathe { 0%,100% { transform: translateY(0) scale(1); } 50% { transform: translateY(-4px) scale(1.03); } }
+    </style>
+  </head>
+  <body>
+    <!-- 本地兜底引导页：引擎在线时由 Rust 侧导航到引擎服务的 /pet/index.html
+         （免构建迭代——桌宠前端改动只碰引擎分支的磁盘文件）。 -->
+    <div class="wrap">
+      <img src="assets/skins/lingxi-hamster/idle.png" alt="" draggable="false" />
+      <span class="tip">连接引擎中…</span>
+    </div>
+  </body>
+</html>

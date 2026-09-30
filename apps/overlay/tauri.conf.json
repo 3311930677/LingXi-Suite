@@ -10,28 +10,9 @@
     "withGlobalTauri": true,
     "windows": [
       {
-        "label": "main",
-        "title": "灵犀",
-        "width": 520,
-        "height": 520,
-        "minWidth": 400,
-        "minHeight": 360,
-        "maxWidth": 1100,
-        "maxHeight": 900,
-        "resizable": true,
-        "decorations": false,
-        "transparent": true,
-        "alwaysOnTop": true,
-        "skipTaskbar": true,
-        "visible": false,
-        "focus": false,
-        "shadow": false,
-        "center": true
-      },
-      {
         "label": "pet",
         "title": "灵犀桌宠",
-        "url": "pet.html",
+        "url": "pet-boot.html",
         "width": 220,
         "height": 260,
         "resizable": false,
@@ -45,7 +26,7 @@
       }
     ],
     "security": {
-      "csp": "default-src 'self'; connect-src ipc: http://ipc.localhost http://ip-api.com https://ipapi.co https://api.open-meteo.com https://geocoding-api.open-meteo.com; img-src 'self' asset: http://asset.localhost data: https:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'",
+      "csp": "default-src 'self'; connect-src ipc: http://ipc.localhost; img-src 'self' asset: http://asset.localhost data:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'",
       "assetProtocol": {
         "enable": true,
         "scope": ["$APPDATA/lingxi/skins/**"]
@@ -57,7 +38,10 @@
     "targets": "all",
     "icon": ["icons/icon.ico"],
     "resources": {
-      "engine-dist/owo-agent.exe": "resources/owo-agent.exe"
+      "engine-dist/owo-agent.exe": "resources/owo-agent.exe",
+      "ui/pet/": "resources/ui/pet/",
+      "ui/assets/": "resources/ui/assets/",
+      "ui/pet-boot.html": "resources/ui/pet-boot.html"
     }
   }
 }
