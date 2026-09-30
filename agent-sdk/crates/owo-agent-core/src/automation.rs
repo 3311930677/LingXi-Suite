@@ -1,7 +1,8 @@
 //! 自动化（v0.4 P1）：定时任务/提醒/监控，全部经审计；桌面端常驻时生效。
 //!
-//! v1 动作类型为提醒（Reminder）；定时触发后写入审计，桌面端轮询提醒列表。
-//! 持久化：`<data>/automations.json`。
+//! 动作类型：提醒（Reminder，压入提醒列表供前端轮询）与 **跑 prompt**
+//! （RunPrompt，A8-1：到点自动执行一个只读 Agent 回合，结果结构化落 run 记录）。
+//! 持久化：`<data>/automations.json`（tasks / reminders / runs）。
 
 use chrono::{DateTime, NaiveTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -20,6 +21,25 @@ pub enum Schedule {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum AutomationAction {
     Reminder { text: String },
+    /// A8-1：到点自动跑一个 Agent 回合。审批策略为「只读自动放行、写/执行默认拒绝」
+    /// （无人在场不能授权）；`session_id` 指定则续跑该会话，否则每次新建独立会话。
+    RunPrompt {
+        prompt: String,
+        #[serde(default)]
+        session_id: Option<String>,
+    },
+}
+
+/// A8-1：一次自动化执行记录（任务中心「次日可查」的载体）。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AutomationRun {
+    pub task_id: String,
+    pub task_name: String,
+    pub at: String,
+    /// `ok` / `failed`
+    pub status: String,
+    #[serde(default)]
+    pub output: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -96,11 +116,15 @@ impl AutomationTask {
     }
 }
 
+/// 执行记录封顶（超出丢弃最旧）。
+const RUNS_LIMIT: usize = 500;
+
 #[derive(Debug, Clone, Default)]
 pub struct AutomationStore {
     root: PathBuf,
     tasks: HashMap<String, AutomationTask>,
     reminders: Vec<String>,
+    runs: Vec<AutomationRun>,
 }
 
 impl AutomationStore {
@@ -109,6 +133,7 @@ impl AutomationStore {
             root,
             tasks: HashMap::new(),
             reminders: Vec::new(),
+            runs: Vec::new(),
         };
         store.load();
         store
@@ -135,6 +160,11 @@ impl AutomationStore {
             ) {
                 self.reminders = reminders;
             }
+            if let Ok(runs) = serde_json::from_value::<Vec<AutomationRun>>(
+                data.get("runs").cloned().unwrap_or_default(),
+            ) {
+                self.runs = runs;
+            }
         }
     }
 
@@ -145,6 +175,7 @@ impl AutomationStore {
         let data = serde_json::json!({
             "tasks": tasks,
             "reminders": self.reminders,
+            "runs": self.runs,
         });
         std::fs::write(
             self.path(),
@@ -194,22 +225,44 @@ impl AutomationStore {
             .collect()
     }
 
-    /// 触发任务：标记 last_run_at，提醒动作追加到提醒列表；返回动作文本。
-    pub fn fire(&mut self, id: &str, now: DateTime<Utc>) -> Result<String, String> {
+    /// 触发任务：标记 last_run_at 并返回动作供调用方分支执行。
+    /// Reminder 顺手压入提醒列表；RunPrompt 的执行与记录由上层负责（需要 Agent）。
+    pub fn fire(&mut self, id: &str, now: DateTime<Utc>) -> Result<AutomationAction, String> {
         let task = self
             .tasks
             .get_mut(id)
             .ok_or_else(|| format!("任务不存在：{id}"))?;
         task.last_run_at = Some(now.to_rfc3339());
-        let text = match &task.action {
-            AutomationAction::Reminder { text } => text.clone(),
-        };
-        self.reminders.push(text.clone());
-        if self.reminders.len() > 200 {
-            self.reminders.drain(..self.reminders.len() - 200);
+        let action = task.action.clone();
+        if let AutomationAction::Reminder { text } = &action {
+            self.reminders.push(text.clone());
+            if self.reminders.len() > 200 {
+                self.reminders.drain(..self.reminders.len() - 200);
+            }
         }
         self.save()?;
-        Ok(text)
+        Ok(action)
+    }
+
+    /// A8-1：记录一次执行结果（任务中心可查；封顶 [`RUNS_LIMIT`] 条，丢最旧）。
+    pub fn record_run(&mut self, run: AutomationRun) -> Result<(), String> {
+        self.runs.push(run);
+        if self.runs.len() > RUNS_LIMIT {
+            let drop_count = self.runs.len() - RUNS_LIMIT;
+            self.runs.drain(..drop_count);
+        }
+        self.save()
+    }
+
+    /// 执行记录（时间倒序；`task_id` 过滤可选）。
+    pub fn runs(&self, task_id: Option<&str>, limit: usize) -> Vec<AutomationRun> {
+        self.runs
+            .iter()
+            .rev()
+            .filter(|run| task_id.map(|id| run.task_id == id).unwrap_or(true))
+            .take(limit)
+            .cloned()
+            .collect()
     }
 
     pub fn reminders(&self) -> &[String] {
@@ -304,8 +357,11 @@ mod tests {
         store.upsert(task.clone()).unwrap();
         let due = store.due_tasks(now);
         assert_eq!(due.len(), 1);
-        let text = store.fire(&due[0], now).unwrap();
-        assert_eq!(text, "休息一下");
+        let action = store.fire(&due[0], now).unwrap();
+        match action {
+            AutomationAction::Reminder { text } => assert_eq!(text, "休息一下"),
+            other => panic!("应为 Reminder：{other:?}"),
+        }
         assert_eq!(store.reminders().len(), 1);
         assert!(store.due_tasks(now).is_empty());
 
@@ -313,6 +369,66 @@ mod tests {
         assert_eq!(reloaded.list().len(), 1);
         assert_eq!(reloaded.reminders().len(), 1);
         reloaded.clear_reminders().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn run_prompt_action_fires_without_pushing_reminder() {
+        let dir = root();
+        let mut store = AutomationStore::new(dir.clone());
+        let now = Utc::now();
+        let mut task = AutomationTask::new(
+            "daily-report",
+            Schedule::Interval { every_secs: 1 },
+            AutomationAction::RunPrompt {
+                prompt: "汇总昨天的改动".to_string(),
+                session_id: None,
+            },
+        );
+        task.created_at = (now - chrono::Duration::seconds(5)).to_rfc3339();
+        store.upsert(task.clone()).unwrap();
+        let due = store.due_tasks(now);
+        assert_eq!(due.len(), 1);
+        let action = store.fire(&due[0], now).unwrap();
+        match action {
+            AutomationAction::RunPrompt { prompt, session_id } => {
+                assert_eq!(prompt, "汇总昨天的改动");
+                assert!(session_id.is_none());
+            }
+            other => panic!("应为 RunPrompt：{other:?}"),
+        }
+        // RunPrompt 不进提醒列表（结果走 run 记录）。
+        assert!(store.reminders().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn runs_are_recorded_persisted_and_filtered() {
+        let dir = root();
+        let mut store = AutomationStore::new(dir.clone());
+        for index in 0..3 {
+            store
+                .record_run(AutomationRun {
+                    task_id: if index == 0 { "a" } else { "b" }.to_string(),
+                    task_name: format!("任务{index}"),
+                    at: Utc::now().to_rfc3339(),
+                    status: "ok".to_string(),
+                    output: Some(format!("结果{index}")),
+                })
+                .unwrap();
+        }
+        // 时间倒序 + 过滤 + limit。
+        let all = store.runs(None, 10);
+        assert_eq!(all.len(), 3);
+        assert_eq!(all[0].output.as_deref(), Some("结果2"));
+        let filtered = store.runs(Some("b"), 10);
+        assert_eq!(filtered.len(), 2);
+        assert_eq!(store.runs(Some("a"), 10).len(), 1);
+        assert_eq!(store.runs(None, 2).len(), 2);
+
+        // 持久化：重载后记录仍在。
+        let reloaded = AutomationStore::new(dir.clone());
+        assert_eq!(reloaded.runs(None, 10).len(), 3);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

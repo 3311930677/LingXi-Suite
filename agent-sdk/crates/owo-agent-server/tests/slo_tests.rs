@@ -152,8 +152,19 @@ fn report_empty_registry_no_panic() {
     assert!(report["slo"].as_array().unwrap().len() == 5);
 }
 
+/// 全局 SLO 注册表是进程级共享状态：下两个用例都会 reset/写入它，
+/// 必须串行执行，否则并行调度会让 `global_achieving()` 断言随机翻车。
+static GLOBAL_SLO_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn global_slo_guard() -> std::sync::MutexGuard<'static, ()> {
+    GLOBAL_SLO_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 #[test]
 fn check_slo_global_records_into_global() {
+    let _guard = global_slo_guard();
     slo::reset_global_for_test();
     let within = slo::check_slo_global("panel_wake", Some(100), true);
     assert!(within);
@@ -173,6 +184,7 @@ fn check_slo_global_records_into_global() {
 
 #[test]
 fn reset_global_for_test_isolates_observations() {
+    let _guard = global_slo_guard();
     slo::reset_global_for_test();
     let _ = slo::check_slo_global("ipc", Some(9), true); // 违规
     assert_eq!(slo::global().get("ipc").unwrap().violation_count(), 1);

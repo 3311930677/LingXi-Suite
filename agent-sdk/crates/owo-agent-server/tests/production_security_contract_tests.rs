@@ -456,7 +456,17 @@ async fn settings_response_contains_no_plaintext_credentials() {
     assert_eq!(settings["model"].as_str(), Some("deepseek-v4-flash"));
 
     // 明文凭据字段永不出现（大小写/变体一并覆盖；`token_budget` 是合法用量预算字段，非凭据）。
-    let text = settings.to_string();
+    // provider 的两个已知安全标记同样剔除后再扫描：`api_key` 恒为 null（占位字段，绝不回传明文）、
+    // `api_key_set` 是「是否已保存密钥」的布尔标记——两者都不携带任何凭据值，其余字段照旧严格扫描。
+    let mut scanned = settings.clone();
+    if let Some(provider) = scanned
+        .get_mut("provider")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        provider.remove("api_key");
+        provider.remove("api_key_set");
+    }
+    let text = scanned.to_string();
     let lower = text.to_lowercase();
     for leak in [
         "api_key",
@@ -473,4 +483,63 @@ async fn settings_response_contains_no_plaintext_credentials() {
             "settings 响应泄露了凭据字段 {leak:?}：{text}"
         );
     }
+}
+
+/// /fs/open 的工作区边界：越界路径一律 403；工作区内不存在的路径 404；空路径 400。
+/// 三类输入都命中「不会真的打开文件」的分支（该端点会启动外部程序，测试必须避开成功路径）。
+#[tokio::test]
+async fn fs_open_rejects_paths_outside_workspace() {
+    let (state, temp) = test_state().await;
+    let app = build_router(Arc::clone(&state));
+    let workspace = temp.path().join("ws");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let outside = temp.path().join("outside.txt");
+    std::fs::write(&outside, b"secret").unwrap();
+
+    // 绝对路径越界 / 相对路径穿越 / 规范化后越界 三种写法都必须挡住。
+    let escaped = [
+        outside.to_string_lossy().to_string(),
+        "../outside.txt".to_string(),
+        workspace
+            .join("..")
+            .join("outside.txt")
+            .to_string_lossy()
+            .to_string(),
+    ];
+    for path in escaped {
+        let body = serde_json::json!({ "path": path, "opener": "system" }).to_string();
+        let response = app
+            .clone()
+            .oneshot(authed_request(&state, "POST", "/fs/open", Some(&body)))
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::FORBIDDEN,
+            "越界路径必须被拒绝：{path}"
+        );
+    }
+
+    // 工作区内但不存在：校验通过、打开失败 → 404（同样不触发外部程序）。
+    let missing = workspace.join("nope.txt");
+    let body =
+        serde_json::json!({ "path": missing.to_string_lossy(), "opener": "system" }).to_string();
+    let response = app
+        .clone()
+        .oneshot(authed_request(&state, "POST", "/fs/open", Some(&body)))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+    // 空路径：400（非法输入，连校验都不进）。
+    let response = app
+        .oneshot(authed_request(
+            &state,
+            "POST",
+            "/fs/open",
+            Some(r#"{"path":"   "}"#),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 }

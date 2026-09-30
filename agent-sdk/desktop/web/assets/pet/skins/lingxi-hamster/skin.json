@@ -1,0 +1,25 @@
+{
+  "id": "lingxi-hamster",
+  "name": "灵犀仓鼠",
+  "author": "LingXi",
+  "version": "1.0.0",
+  "description": "灵犀默认形象：一只圆滚滚的仓鼠，随状态切换表情。",
+  "states": {
+    "idle": {
+      "image": "idle.png",
+      "bubble": "灵犀"
+    },
+    "thinking": {
+      "image": "thinking.png",
+      "bubble": "思考中…"
+    },
+    "speaking": {
+      "image": "speaking.png",
+      "bubble": "建议好了"
+    },
+    "alert": {
+      "image": "alert.png",
+      "bubble": "QQ 新消息"
+    }
+  }
+}

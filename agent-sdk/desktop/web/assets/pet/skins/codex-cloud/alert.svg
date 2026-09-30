@@ -1,0 +1,40 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 208" width="200" height="208">
+  <defs>
+    <linearGradient id="cloud" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#93B3F8"/>
+      <stop offset="1" stop-color="#5A82EC"/>
+    </linearGradient>
+    <linearGradient id="shoulder" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#3D5CD2"/>
+      <stop offset="1" stop-color="#2A3EA6"/>
+    </linearGradient>
+    <linearGradient id="visor" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#2B3653"/>
+      <stop offset="1" stop-color="#151C2E"/>
+    </linearGradient>
+  </defs>
+  <path d="M54 154 q46 -22 92 0 l6 40 h-104 z" fill="url(#shoulder)"/>
+  <g>
+    <animateTransform attributeName="transform" type="translate" values="0 0;-3 0;3 0;-3 0;3 0;0 0" dur="0.62s" repeatCount="indefinite"/>
+    <g>
+      <circle cx="60" cy="92" r="30" fill="url(#cloud)"/>
+      <circle cx="100" cy="70" r="38" fill="url(#cloud)"/>
+      <circle cx="140" cy="92" r="30" fill="url(#cloud)"/>
+      <circle cx="48" cy="122" r="24" fill="url(#cloud)"/>
+      <circle cx="152" cy="122" r="24" fill="url(#cloud)"/>
+      <circle cx="100" cy="120" r="46" fill="url(#cloud)"/>
+    </g>
+    <ellipse cx="80" cy="60" rx="17" ry="9" fill="#FFFFFF" opacity="0.28"/>
+    <rect x="50" y="74" width="100" height="64" rx="20" fill="url(#visor)"/>
+    <rect x="50" y="74" width="100" height="64" rx="20" fill="none" stroke="#0C1120" stroke-width="3" opacity="0.55"/>
+    <g fill="none" stroke="#FFD479" stroke-width="10" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M76 92 l17 14 -17 14"/>
+      <path d="M130 106 v16">
+        <animate attributeName="opacity" values="1;0.35;1" dur="0.62s" repeatCount="indefinite"/>
+      </path>
+    </g>
+    <circle cx="130" cy="132" r="5" fill="#FFD479">
+      <animate attributeName="opacity" values="1;0.35;1" dur="0.62s" repeatCount="indefinite"/>
+    </circle>
+  </g>
+</svg>

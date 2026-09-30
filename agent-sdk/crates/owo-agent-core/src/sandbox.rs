@@ -201,7 +201,9 @@ impl SandboxCommand {
         self.policy.validate()?;
         if self.policy.file_scope == FileScope::WorkspaceOnly {
             if let (Some(cwd), Some(root)) = (&self.cwd, &self.policy.workspace) {
-                if cwd.is_absolute() && !cwd.starts_with(root) {
+                // 用归一化比较（容忍 canonicalize 的 `\\?\` verbatim 前缀差异），
+                // 裸 starts_with 会把工作区内的 cwd 误判为越界。
+                if cwd.is_absolute() && !crate::permissions::path_within(cwd, root) {
                     return Err(SandboxError::PolicyViolation(format!(
                         "工作目录越界：{} 不在工作区 {} 内",
                         cwd.display(),
@@ -887,7 +889,7 @@ impl Drop for JobGuard {
 
 /// 路径工具：判断目标是否位于工作区内（越界样例矩阵用）。
 pub fn inside_workspace(workspace: &Path, target: &Path) -> bool {
-    target.starts_with(workspace)
+    crate::permissions::path_within(target, workspace)
 }
 
 /// AppContainer 网络能力 SID（S-1-15-2-1 InternetClient）。

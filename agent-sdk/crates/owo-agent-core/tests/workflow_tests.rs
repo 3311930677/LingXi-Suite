@@ -1069,3 +1069,35 @@ fn permission_modes_serialize_snake_case() {
     let back: PermissionClaim = serde_json::from_str(&json).unwrap();
     assert_eq!(back.mode, PermMode::Ask);
 }
+
+// ---------------------------------------------------------------------------
+// 27. 触发器 JSON 扁平化（.owflow 手写友好）
+// ---------------------------------------------------------------------------
+
+#[test]
+fn trigger_kind_is_flattened_in_json() {
+    // 单元变体：{"id":"t1","kind":"manual"}，而非 {"kind":{"kind":"manual"}}
+    let manual = WorkflowTrigger {
+        id: "t1".into(),
+        kind: TriggerKind::Manual,
+    };
+    let value = serde_json::to_value(&manual).unwrap();
+    assert_eq!(value, json!({ "id": "t1", "kind": "manual" }));
+    let back: WorkflowTrigger = serde_json::from_value(value).unwrap();
+    assert_eq!(back, manual);
+
+    // 带字段变体：{"id":"t2","kind":"schedule","expression":"0 9 * * *"}
+    let schedule = WorkflowTrigger {
+        id: "t2".into(),
+        kind: TriggerKind::Schedule {
+            expression: "0 9 * * *".into(),
+        },
+    };
+    let value = serde_json::to_value(&schedule).unwrap();
+    assert_eq!(
+        value,
+        json!({ "id": "t2", "kind": "schedule", "expression": "0 9 * * *" })
+    );
+    let back: WorkflowTrigger = serde_json::from_value(value).unwrap();
+    assert_eq!(back, schedule);
+}

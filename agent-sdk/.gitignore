@@ -1,0 +1,17 @@
+# Rust 构建产物
+/target
+
+# 运行期日志残留（手工验收 / mock 服务输出）
+*.err
+*.out
+*.log
+evals/*.jsonl
+
+# 工作区配置：settings.json.owo-crypt 是 DPAPI 信封（绑定创建者 Windows 账户），
+# 到了别的机器/账户必然解密失败且 load_encrypted 显式报错不回退——绝不能入库。
+# settings.json 含本机 model/base_url 配置，同样不入库。
+settings.json
+settings.json.owo-crypt
+
+# Node（web 验收辅助）
+node_modules/

@@ -35,13 +35,13 @@ fn model_name() -> String {
     std::env::var("PADDLE_OCR_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.to_string())
 }
 
-/// 本地 ONNX OCR 通道（Windows）：模型就绪时返回 Some(结果)，未就绪返回 None。
-#[cfg(target_os = "windows")]
+/// 本地 ONNX OCR 通道（Windows + 本地推理）：模型就绪时返回 Some(结果)，未就绪返回 None。
+#[cfg(all(target_os = "windows", feature = "native-inference"))]
 fn local_onnx_ocr(bmp: &[u8]) -> Option<Result<OcrSummary, String>> {
     crate::onnx_ocr::cached_engine().map(|engine| crate::onnx_ocr::ocr_bmp_onnx(bmp, &engine))
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(not(all(target_os = "windows", feature = "native-inference")))]
 fn local_onnx_ocr(_bmp: &[u8]) -> Option<Result<OcrSummary, String>> {
     None
 }

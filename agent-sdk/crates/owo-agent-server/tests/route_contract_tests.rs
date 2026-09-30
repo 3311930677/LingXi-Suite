@@ -175,6 +175,8 @@ fn sample_body(path: &str) -> Option<&'static str> {
         "/session" => Some(r#"{"workspace":".","model":"idle"}"#),
         "/session/{id}/turn" => Some(r#"{"prompt":"hi"}"#),
         "/session/{id}/permission/{request_id}" => Some(r#"{"allow":true}"#),
+        // ask_user 应答：提问不在等待中 → handler 返回 404（资源缺失，非路由缺失）。
+        "/session/{id}/answer/{question_id}" => Some(r#"{"answer":"契约测试回答"}"#),
         "/plugins/{id}/enabled" => Some(r#"{"enabled":false}"#),
         "/subagent/run" => Some(r#"{"prompt":"hi","read_only":true}"#),
         "/project/rules" => Some(r#"{"content":"rules"}"#),
@@ -204,7 +206,7 @@ fn sample_body(path: &str) -> Option<&'static str> {
         "/plugins/market/update" => Some(r#"{"id":"x","dir":"."}"#),
         "/plugins/market/uninstall" => Some(r#"{"id":"x"}"#),
         "/workflow/validate" => Some(
-            r#"{"id":"ct","name":"ct-flow","version":1,"triggers":[{"id":"t1","kind":{"kind":"manual"}}],"permissions":[{"scope":"fs.write","mode":"allow"}],"preconditions":[],"rollback_points":[],"max_steps":100,"subflow_depth_limit":5,"steps":[{"kind":"notify","id":"n1","message":"ok"}]}"#,
+            r#"{"id":"ct","name":"ct-flow","version":1,"triggers":[{"id":"t1","kind":"manual"}],"permissions":[{"scope":"fs.write","mode":"allow"}],"preconditions":[],"rollback_points":[],"max_steps":100,"subflow_depth_limit":5,"steps":[{"kind":"notify","id":"n1","message":"ok"}]}"#,
         ),
         "/workflow/{name}/run" => Some(r#"{}"#),
         "/workflow/run/{run_id}/abort" => Some(r#"{}"#),
@@ -234,6 +236,7 @@ fn sample_body(path: &str) -> Option<&'static str> {
 fn sample_path(path: &str, session_id: &str) -> String {
     path.replace("{id}", session_id)
         .replace("{request_id}", "no-such-request")
+        .replace("{question_id}", "no-such-question")
         .replace("{name}", "no-such-name")
         .replace("{index}", "0")
         .replace("{app_id}", "no-such-app")
@@ -288,6 +291,8 @@ fn resource_404_ok(path: &str) -> bool {
             | "/team/export"
             | "/eval/run"
             | "/session/{id}/permission/{request_id}"
+            // 提问不存在/已被回答/回合已结束 → 资源缺失 404（路由本身已注册）。
+            | "/session/{id}/answer/{question_id}"
             // R12 /fleet/*（任务/审批资源不存在 → 404 由资源缺失产生，非路由缺失）。
             | "/fleet/tasks/{id}"
             | "/fleet/tasks/{id}/cancel"
@@ -325,6 +330,11 @@ async fn all_contract_endpoints_are_reachable() {
 
     let mut failed: Vec<String> = Vec::new();
     for (path, methods) in contract_endpoints() {
+        // /fs/pick-directory 会拉起系统原生「选择文件夹」对话框（阻塞至多 180s），
+        // 契约测试只校验路由登记与 OpenAPI 一致性，不实际调起 GUI。
+        if path == "/fs/pick-directory" {
+            continue;
+        }
         for method in methods {
             let is_get_like = matches!(method.as_str(), "GET" | "DELETE");
             let body = if is_get_like {

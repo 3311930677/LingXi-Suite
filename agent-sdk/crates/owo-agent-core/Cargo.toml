@@ -4,6 +4,13 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = ["native-inference"]
+# 本地推理：OCR 走 ort/onnxruntime，STT 走 sherpa-onnx。
+# 两者在 Windows 上是 MSVC 静态 C++ 库，缺少 MSVC 工具链的机器无法链接，
+# 此时可用 `--no-default-features` 构建：OCR 自动降级 Media.Ocr / Paddle 云，本地 STT 返回“未启用”。
+native-inference = ["dep:ndarray", "dep:ort", "dep:sherpa-onnx"]
+
 [dependencies]
 owo-agent-protocol.workspace = true
 serde.workspace = true
@@ -27,12 +34,14 @@ aes-gcm = "0.10"
 chacha20poly1305 = "0.10"
 rand = "0.8"
 hmac = "0.12"
+regex.workspace = true
+tiktoken-rs = "0.12.1"
 
 [target.'cfg(windows)'.dependencies]
-ndarray = "0.17"
+ndarray = { version = "0.17", optional = true }
 futures = "0.3"
-ort = { version = "2.0.0-rc.13", features = ["ndarray"] }
-sherpa-onnx = "1.13"
+ort = { version = "2.0.0-rc.13", features = ["ndarray"], optional = true }
+sherpa-onnx = { version = "1.13", optional = true }
 windows = { version = "0.61", features = [
     "Win32_Foundation",
     "Graphics_Imaging",
@@ -54,6 +63,11 @@ windows-sys = { version = "0.59", features = [
     "Win32_Graphics_Gdi",
     "Win32_Storage_Xps",
 ] }
+
+[dev-dependencies]
+# tests/crypto_contract.rs 手构 v2/v3 兼容夹具所需（版本与主依赖一致，Cargo.lock 不变）
+sha2.workspace = true
+hmac = "0.12"
 
 [[bin]]
 name = "owo-mcp-test-server"

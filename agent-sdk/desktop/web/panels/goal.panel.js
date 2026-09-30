@@ -9,7 +9,7 @@ window.OwoPanels.goal = (function () {
   var id = "goal";
 
   function defaultHelpers() {
-    var baseUrl = (window.OwoPanels && window.OwoPanels.baseUrl) || "http://127.0.0.1:4098";
+    var baseUrl = (window.OwoPanels && window.OwoPanels.baseUrl) || window.location.origin;
     function get(path) {
       return fetch(baseUrl + path).then(function (r) {
         if (!r.ok) throw new Error("HTTP " + r.status);
@@ -59,15 +59,15 @@ window.OwoPanels.goal = (function () {
     return (
       '<section data-panel="' + id + '">' +
       '<style>' +
-      '.owo-goal-row{display:flex;gap:8px;align-items:center;padding:4px 0;border-bottom:1px solid #eee}' +
+      '.owo-goal-row{display:flex;gap:8px;align-items:center;padding:4px 0;border-bottom:1px solid var(--border)}' +
       '.owo-goal-steps{width:100%;min-height:120px;font-family:monospace;font-size:12px}' +
       '.owo-goal-table{width:100%;border-collapse:collapse;font-size:12px}' +
-      '.owo-goal-table td,.owo-goal-table th{border:1px solid #ddd;padding:3px 6px;text-align:left}' +
-      '.owo-goal-badge{display:inline-block;padding:1px 6px;border-radius:8px;font-size:11px;color:#fff}' +
-      '.owo-goal-badge.ok{background:#2e7d32}.owo-goal-badge.bad{background:#c62828}' +
-      '.owo-goal-badge.warn{background:#ef6c00}' +
-      '.owo-goal-cloudlog{height:140px;overflow:auto;background:#111;color:#7cff9b;font-family:monospace;font-size:12px;padding:6px}' +
-      '.owo-goal-output{max-height:120px;overflow:auto;white-space:pre-wrap;font-family:monospace;font-size:11px;background:#f6f8fa;padding:4px;margin-top:2px}' +
+      '.owo-goal-table td,.owo-goal-table th{border:1px solid var(--border-strong);padding:3px 6px;text-align:left}' +
+      '.owo-goal-badge{display:inline-block;padding:1px 6px;border-radius:8px;font-size:11px;color:var(--accent-ink)}' +
+      '.owo-goal-badge.ok{background:var(--green)}.owo-goal-badge.bad{background:var(--red)}' +
+      '.owo-goal-badge.warn{background:var(--yellow)}' +
+      '.owo-goal-cloudlog{height:140px;overflow:auto;background:var(--surface-2);color:var(--green);font-family:monospace;font-size:12px;padding:6px}' +
+      '.owo-goal-output{max-height:120px;overflow:auto;white-space:pre-wrap;font-family:monospace;font-size:11px;background:var(--surface-2);padding:4px;margin-top:2px}' +
       '</style>' +
       '<div class="stack">' +
       '<div class="sub">编排目标（Goal/Plan）</div>' +
@@ -348,7 +348,7 @@ window.OwoPanels.goal = (function () {
     var taskId = (input && input.value.trim()) || "";
     if (!taskId) return;
     closeCloud();
-    var base = H.baseUrl || "http://127.0.0.1:4098";
+    var base = H.baseUrl || window.location.origin;
     var log = document.getElementById("owo-goal-cloudlog");
     if (log) log.textContent = "订阅 " + taskId + " ...";
     cloudSource = new EventSource(base + "/cloud/tasks/" + encodeURIComponent(taskId) + "/events");

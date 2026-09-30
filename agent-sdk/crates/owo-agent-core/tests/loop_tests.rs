@@ -113,6 +113,24 @@ impl ModelProvider for ScriptedProvider {
     }
 }
 
+fn calls(
+    id_a: (&str, &str, serde_json::Value),
+    id_b: (&str, &str, serde_json::Value),
+) -> ModelOutput {
+    ModelOutput::ToolCalls(vec![
+        ToolCall {
+            id: id_a.0.to_string(),
+            name: id_a.1.to_string(),
+            arguments: id_a.2,
+        },
+        ToolCall {
+            id: id_b.0.to_string(),
+            name: id_b.1.to_string(),
+            arguments: id_b.2,
+        },
+    ])
+}
+
 fn call(id: &str, name: &str, args: serde_json::Value) -> ModelOutput {
     ModelOutput::ToolCalls(vec![ToolCall {
         id: id.to_string(),
@@ -553,6 +571,56 @@ async fn revert_removes_created_file() {
 }
 
 #[tokio::test]
+async fn read_only_tools_run_concurrently_and_results_keep_call_order() {
+    let workspace = temp_workspace("parallel-read");
+    std::fs::write(workspace.join("a.txt"), "alpha-content\n").unwrap();
+    std::fs::write(workspace.join("b.txt"), "beta-content\n").unwrap();
+    let provider = ScriptedProvider::new(vec![
+        calls(
+            ("p1", "read_file", json!({ "path": "a.txt" })),
+            ("p2", "read_file", json!({ "path": "b.txt" })),
+        ),
+        ModelOutput::Text("读完了".to_string()),
+    ]);
+    let agent = build_agent(&workspace, provider);
+    let mut session = Session::new(&workspace, "mock".to_string(), None);
+    let abort = AtomicBool::new(false);
+    let approver = AutoApprover { allow: true };
+
+    let outcome = agent
+        .run_turn(
+            &mut session,
+            "一起读 a.txt 和 b.txt",
+            &approver,
+            &abort,
+            &mut |_| {},
+        )
+        .await
+        .unwrap();
+    assert_eq!(outcome.steps, 2);
+
+    // tool 结果必须按模型给出的调用顺序回写（p1 → p2），且内容各自正确。
+    let tool_ids: Vec<String> = session
+        .messages
+        .iter()
+        .filter(|message| message.role == "tool")
+        .filter_map(|message| message.tool_call_id.clone())
+        .collect();
+    assert_eq!(tool_ids, vec!["p1".to_string(), "p2".to_string()]);
+
+    let joined = session
+        .messages
+        .iter()
+        .filter(|message| message.role == "tool")
+        .filter_map(|message| message.content.clone())
+        .collect::<Vec<_>>()
+        .join("");
+    assert!(joined.contains("alpha-content"), "{joined}");
+    assert!(joined.contains("beta-content"), "{joined}");
+    let _ = std::fs::remove_dir_all(&workspace);
+}
+
+#[tokio::test]
 async fn streaming_deltas_are_emitted_and_final_text_returned() {
     let workspace = temp_workspace("streaming");
     let provider = StreamingProvider {
@@ -790,7 +858,9 @@ async fn direct_general_subagent_cannot_write_without_approval_channel() {
 }
 
 #[tokio::test]
-async fn max_turns_returns_error_and_persists_partial_history() {
+async fn max_turns_falls_back_to_visible_reply_and_persists_partial_history() {
+    // 新契约（「不管怎么样都要执行完然后给用户回复」）：步数耗尽不再是硬错误。
+    // 收尾总结本身失败时，用系统整理的工作摘要兜底成可见回复，同时保留部分历史。
     let workspace = temp_workspace("max-turns");
     let provider = ScriptedProvider::new(vec![call(
         "read-1",
@@ -807,7 +877,7 @@ async fn max_turns_returns_error_and_persists_partial_history() {
     let abort = AtomicBool::new(false);
     let approver = AutoApprover { allow: true };
 
-    let error = agent
+    let outcome = agent
         .run_turn(
             &mut session,
             "读取 missing.txt",
@@ -816,9 +886,15 @@ async fn max_turns_returns_error_and_persists_partial_history() {
             &mut |_| {},
         )
         .await
-        .unwrap_err();
+        .expect("步数耗尽也必须以可见回复收尾，而不是把错误甩给用户");
 
-    assert!(error.to_string().contains("最大回合数"));
+    let text = outcome.final_text.unwrap_or_default();
+    assert!(!text.trim().is_empty(), "兜底回复不能为空");
+    assert!(text.contains("最大回合数"), "应说明步数耗尽原因：{text}");
+    assert!(
+        text.contains("read_file"),
+        "摘要应列出已执行的工具动作：{text}"
+    );
     assert!(session.messages.iter().any(|message| {
         message.role == "user" && message.content.as_deref() == Some("读取 missing.txt")
     }));

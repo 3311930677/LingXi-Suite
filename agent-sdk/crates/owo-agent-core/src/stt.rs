@@ -5,6 +5,7 @@
 
 use crate::settings::SttSettings;
 use std::path::{Path, PathBuf};
+#[cfg(all(target_os = "windows", feature = "native-inference"))]
 use std::sync::Mutex;
 
 #[derive(Debug, Clone)]
@@ -20,14 +21,14 @@ pub struct LocalStt {
     language: String,
     itn: bool,
     /// 缓存识别器，避免每次请求重新加载模型（约 3s → 数百 ms）。
-    #[cfg(target_os = "windows")]
+    #[cfg(all(target_os = "windows", feature = "native-inference"))]
     recognizer: Mutex<Option<sherpa_onnx::OfflineRecognizer>>,
 }
 
 // sherpa-onnx 内部是 C 指针；由 Mutex 串行化访问，跨线程移动是安全的。
-#[cfg(target_os = "windows")]
+#[cfg(all(target_os = "windows", feature = "native-inference"))]
 unsafe impl Send for LocalStt {}
-#[cfg(target_os = "windows")]
+#[cfg(all(target_os = "windows", feature = "native-inference"))]
 unsafe impl Sync for LocalStt {}
 
 impl LocalStt {
@@ -46,7 +47,7 @@ impl LocalStt {
             engine: settings.model.clone(),
             language,
             itn,
-            #[cfg(target_os = "windows")]
+            #[cfg(all(target_os = "windows", feature = "native-inference"))]
             recognizer: Mutex::new(None),
         }
     }
@@ -89,7 +90,7 @@ impl LocalStt {
             .join("stt")
             .join(&settings.model);
         self.engine = settings.model.clone();
-        #[cfg(target_os = "windows")]
+        #[cfg(all(target_os = "windows", feature = "native-inference"))]
         if let Ok(mut guard) = self.recognizer.lock() {
             *guard = None;
         }
@@ -100,7 +101,7 @@ impl LocalStt {
             && self.model_dir.join("tokens.txt").exists()
     }
 
-    #[cfg(target_os = "windows")]
+    #[cfg(all(target_os = "windows", feature = "native-inference"))]
     fn recognizer(
         &self,
     ) -> Result<std::sync::MutexGuard<'_, Option<sherpa_onnx::OfflineRecognizer>>, String> {
@@ -133,7 +134,7 @@ impl LocalStt {
 
     /// 离线转写 WAV（16k PCM 单声道；SenseVoice-Small via sherpa-onnx）。
     pub fn transcribe_wav(&self, wav_path: &Path) -> Result<SttOutcome, String> {
-        #[cfg(target_os = "windows")]
+        #[cfg(all(target_os = "windows", feature = "native-inference"))]
         {
             if !self.is_ready() {
                 return Err(format!(
@@ -163,10 +164,10 @@ impl LocalStt {
                 elapsed_ms: started.elapsed().as_millis() as u64,
             })
         }
-        #[cfg(not(target_os = "windows"))]
+        #[cfg(not(all(target_os = "windows", feature = "native-inference")))]
         {
             let _ = (wav_path, self);
-            Err("本地 STT 暂仅支持 Windows".to_string())
+            Err("本地语音转写未启用：当前构建未包含本地推理模块".to_string())
         }
     }
 }
@@ -184,7 +185,10 @@ mod tests {
         assert!(!stt.is_ready());
         assert_eq!(stt.engine(), "SenseVoice-Small");
         let error = stt.transcribe_wav(Path::new("missing.wav")).unwrap_err();
+        #[cfg(all(target_os = "windows", feature = "native-inference"))]
         assert!(error.contains("模型未就绪"));
+        #[cfg(not(all(target_os = "windows", feature = "native-inference")))]
+        assert!(error.contains("未启用"));
     }
 
     #[test]
@@ -208,7 +212,7 @@ mod tests {
             stt.model_dir(),
             Path::new("C:\\owo-nonexistent-data-root\\models\\stt\\Other-ASR")
         );
-        #[cfg(target_os = "windows")]
+        #[cfg(all(target_os = "windows", feature = "native-inference"))]
         assert!(stt.recognizer.lock().unwrap().is_none());
     }
 }

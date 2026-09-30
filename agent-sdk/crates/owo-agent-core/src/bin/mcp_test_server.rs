@@ -4,10 +4,75 @@
 //! - echo(text)：原样回显
 //! - add(a, b)：求和并以文本返回
 //! - hang(sleep_ms)：挂起指定毫秒（超时/重连测试用）
-//! 未知工具返回 JSON-RPC 错误。收到 `exit` 通知或 stdin EOF 后退出。
+//! - resources/list + resources/read（A2-2：file:///readme.md、note://tips）
+//! - prompts/list + prompts/get（summarize 模板）
+//!   未知工具返回 JSON-RPC 错误。收到 `exit` 通知或 stdin EOF 后退出。
 
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+fn resources_response() -> Value {
+    json!({
+        "resources": [
+            {
+                "uri": "file:///readme.md",
+                "name": "readme",
+                "description": "项目说明",
+                "mimeType": "text/markdown"
+            },
+            {
+                "uri": "note://tips",
+                "name": "tips",
+                "description": "使用技巧"
+            }
+        ]
+    })
+}
+
+fn read_resource(params: &Value) -> Result<Value, Value> {
+    let uri = params.get("uri").and_then(Value::as_str).unwrap_or_default();
+    match uri {
+        "file:///readme.md" => Ok(json!({
+            "contents": [ { "uri": uri, "mimeType": "text/markdown", "text": "# 欢迎\n这是测试 README" } ]
+        })),
+        "note://tips" => Ok(json!({
+            "contents": [ { "uri": uri, "text": "提示内容" } ]
+        })),
+        other => Err(json!({ "code": -32602, "message": format!("未知资源：{other}") })),
+    }
+}
+
+fn prompts_response() -> Value {
+    json!({
+        "prompts": [
+            {
+                "name": "summarize",
+                "description": "生成摘要模板",
+                "arguments": [
+                    { "name": "topic", "description": "主题", "required": true }
+                ]
+            }
+        ]
+    })
+}
+
+fn get_prompt(params: &Value) -> Result<Value, Value> {
+    let name = params.get("name").and_then(Value::as_str).unwrap_or_default();
+    if name != "summarize" {
+        return Err(json!({ "code": -32602, "message": format!("未知模板：{name}") }));
+    }
+    let topic = params
+        .get("arguments")
+        .and_then(|args| args.get("topic"))
+        .and_then(Value::as_str)
+        .unwrap_or("(未指定)");
+    Ok(json!({
+        "description": "生成摘要模板",
+        "messages": [
+            { "role": "user", "content": { "type": "text", "text": format!("请总结主题：{topic}") } }
+        ]
+    }))
+}
 
 fn tools_response() -> Value {
     json!({
@@ -108,13 +173,17 @@ async fn main() {
         let result = match method.as_str() {
             "initialize" => Ok(json!({
                 "protocolVersion": "2025-06-18",
-                "capabilities": { "tools": {} },
+                "capabilities": { "tools": {}, "resources": {}, "prompts": {} },
                 "serverInfo": {
                     "name": "owo-mcp-test-server",
                     "version": env!("CARGO_PKG_VERSION")
                 }
             })),
             "tools/list" => Ok(tools_response()),
+            "resources/list" => Ok(resources_response()),
+            "resources/read" => read_resource(&params),
+            "prompts/list" => Ok(prompts_response()),
+            "prompts/get" => get_prompt(&params),
             "tools/call" => {
                 let name = params
                     .get("name")

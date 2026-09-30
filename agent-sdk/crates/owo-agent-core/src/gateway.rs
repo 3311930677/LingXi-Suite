@@ -13,6 +13,18 @@ pub struct ToolCall {
     pub arguments: Value,
 }
 
+/// 图片输入单元（A1-2 多模态）：URL（http/https）或 base64 data URL。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MessageImage {
+    pub url: String,
+}
+
+impl MessageImage {
+    pub fn from_url(url: impl Into<String>) -> Self {
+        Self { url: url.into() }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
     pub role: String,
@@ -22,6 +34,11 @@ pub struct ChatMessage {
     pub tool_calls: Option<Vec<ToolCall>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
+    /// 图片输入（A1-2）：content 保持纯文本，provider 层在 images 非空且角色
+    /// 为 user 时把 wire 内容转成 parts 数组（OpenAI: image_url / Anthropic: image）。
+    /// 附加可选字段：老会话记录缺省时视为空，向前兼容。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<MessageImage>,
 }
 
 impl ChatMessage {
@@ -31,6 +48,7 @@ impl ChatMessage {
             content: Some(content),
             tool_calls: None,
             tool_call_id: None,
+            images: Vec::new(),
         }
     }
 
@@ -40,6 +58,18 @@ impl ChatMessage {
             content: Some(content),
             tool_calls: None,
             tool_call_id: None,
+            images: Vec::new(),
+        }
+    }
+
+    /// 带图片的用户消息（A1-2 多模态：截图/贴图进主对话上下文）。
+    pub fn user_with_images(content: String, images: Vec<MessageImage>) -> Self {
+        Self {
+            role: "user".into(),
+            content: Some(content),
+            tool_calls: None,
+            tool_call_id: None,
+            images,
         }
     }
 
@@ -49,6 +79,7 @@ impl ChatMessage {
             content: Some(content),
             tool_calls: None,
             tool_call_id: None,
+            images: Vec::new(),
         }
     }
 
@@ -58,6 +89,7 @@ impl ChatMessage {
             content: None,
             tool_calls: Some(tool_calls),
             tool_call_id: None,
+            images: Vec::new(),
         }
     }
 
@@ -67,6 +99,7 @@ impl ChatMessage {
             content: Some(content),
             tool_calls: None,
             tool_call_id: Some(tool_call_id),
+            images: Vec::new(),
         }
     }
 }
@@ -167,6 +200,13 @@ pub enum ModelOutput {
     ToolCalls(Vec<ToolCall>),
 }
 
+/// 流式增量块：正文（对用户可见的回答）或思考（深度思考过程，不写入对话历史）。
+#[derive(Debug, Clone, PartialEq)]
+pub enum StreamChunk {
+    Content(String),
+    Reasoning(String),
+}
+
 #[async_trait]
 pub trait ModelProvider: Send + Sync {
     async fn complete(
@@ -190,13 +230,25 @@ pub trait ModelProvider: Send + Sync {
         Ok(output)
     }
 
+    /// 带思考通道的流式补全：正文与思考增量统一经 `on_chunk` 回调（类型区分）。
+    /// 默认实现委托 `complete_stream`（不支持的 provider 自动兼容，思考块缺失）。
+    async fn complete_stream_with_reasoning(
+        &self,
+        messages: &[ChatMessage],
+        tools: &[ToolSpec],
+        on_chunk: &mut (dyn FnMut(StreamChunk) + Send),
+    ) -> Result<ModelOutput, String> {
+        let mut forward = |text: String| on_chunk(StreamChunk::Content(text));
+        self.complete_stream(messages, tools, &mut forward).await
+    }
+
     /// 累计 token 用量快照（供回合增量统计；未实现的 Provider 返回零）。
     fn usage_snapshot(&self) -> TokenUsage {
         TokenUsage::default()
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct OpenAiCompatibleConfig {
     pub base_url: String,
     pub api_key: String,
@@ -205,22 +257,125 @@ pub struct OpenAiCompatibleConfig {
     pub cloud_enabled: bool,
 }
 
+/// 设置页保存的接入配置（进程内生效，落盘在 settings.json + 加密信封）。
+/// 放在 from_env() 之前裁决，这样已保存的端点/密钥/模型优于启动终端的环境变量，
+/// 且无需改动各处 `OpenAiCompatibleConfig::from_env()` 调用点。
+#[derive(Debug, Clone, Default)]
+struct ProviderOverride {
+    base_url: Option<String>,
+    api_key: Option<String>,
+    model: Option<String>,
+}
+
+static PROVIDER_OVERRIDE: std::sync::OnceLock<std::sync::Mutex<Option<ProviderOverride>>> =
+    std::sync::OnceLock::new();
+
+fn provider_override() -> Option<ProviderOverride> {
+    PROVIDER_OVERRIDE
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .ok()
+        .and_then(|guard| (*guard).clone())
+}
+
+/// 未显式配置模型时的内置默认（CLI / 服务端 / 网关共用，避免多处漂移）。
+pub const DEFAULT_MODEL: &str = "deepseek-v4-flash";
+
+/// 服务端加载/保存 settings 后调用：让设置页保存的接入配置优先于环境变量。
+/// 传 None 的字段表示「该项未配置，回退环境变量」。
+pub fn set_provider_override(
+    base_url: Option<String>,
+    api_key: Option<String>,
+    model: Option<String>,
+) {
+    let cell = PROVIDER_OVERRIDE.get_or_init(|| std::sync::Mutex::new(None));
+    if let Ok(mut slot) = cell.lock() {
+        *slot = Some(ProviderOverride {
+            base_url,
+            api_key,
+            model,
+        });
+    }
+}
+
+/// 显式模型覆盖（CLI `--model`）：单独存放，优先级最高（压过设置页保存值与环境变量）。
+///
+/// 不复用 `PROVIDER_OVERRIDE.model` 的原因：CLI 的 `build_agent` 会在构造 agent 时再调一次
+/// `apply_provider_override()`（用 settings 的 model 整体覆盖），把它冲掉。分开放就不依赖调用顺序。
+static MODEL_OVERRIDE: std::sync::OnceLock<std::sync::Mutex<Option<String>>> =
+    std::sync::OnceLock::new();
+
+/// 强制当前进程使用指定模型（CLI `--model` 用；此前只写进会话记录，wire 上仍是 env/settings 的值）。
+pub fn set_model_override(model: impl Into<String>) {
+    let cell = MODEL_OVERRIDE.get_or_init(|| std::sync::Mutex::new(None));
+    if let Ok(mut slot) = cell.lock() {
+        *slot = Some(model.into());
+    }
+}
+
+fn model_override() -> Option<String> {
+    MODEL_OVERRIDE
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .ok()
+        .and_then(|guard| guard.clone())
+}
+
+#[cfg(test)]
+fn clear_model_override() {
+    if let Ok(mut slot) = MODEL_OVERRIDE
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+    {
+        *slot = None;
+    }
+}
+
+/// 当前进程的模型接入是否就绪（供设置页与首屏判断是否需要引导用户配置）。
+pub fn provider_ready() -> bool {
+    if wants_anthropic() {
+        return crate::anthropic::AnthropicConfig::from_env().is_ok();
+    }
+    OpenAiCompatibleConfig::from_env().is_ok()
+}
+
 impl OpenAiCompatibleConfig {
     pub fn from_env() -> Result<Self, String> {
-        let base_url = std::env::var("OPENAI_BASE_URL")
-            .unwrap_or_else(|_| "https://api.openai.com/v1".to_string());
-        let api_key = match std::env::var("OPENAI_API_KEY") {
-            Ok(value) => value,
-            Err(_) if is_local_endpoint(&base_url) => String::new(),
-            Err(_) => {
+        let over = provider_override();
+        // 已保存值优先，留空则回退环境变量，再回退内置默认。
+        let pick = |env_key: &str, saved: Option<&String>| -> Option<String> {
+            saved
+                .filter(|value| !value.trim().is_empty())
+                .cloned()
+                .or_else(|| {
+                    std::env::var(env_key)
+                        .ok()
+                        .filter(|value| !value.trim().is_empty())
+                })
+        };
+        let base_url = pick(
+            "OPENAI_BASE_URL",
+            over.as_ref().and_then(|o| o.base_url.as_ref()),
+        )
+        .unwrap_or_else(|| "https://api.openai.com/v1".to_string());
+        let api_key = pick(
+            "OPENAI_API_KEY",
+            over.as_ref().and_then(|o| o.api_key.as_ref()),
+        );
+        // 优先级：CLI `--model` 显式覆盖 > 设置页保存值 > OPENAI_MODEL 环境变量 > 内置默认。
+        let model = model_override()
+            .or_else(|| pick("OPENAI_MODEL", over.as_ref().and_then(|o| o.model.as_ref())))
+            .unwrap_or_else(|| DEFAULT_MODEL.to_string());
+        let api_key = match api_key {
+            Some(value) => value,
+            None if is_local_endpoint(&base_url) => String::new(),
+            None => {
                 return Err(
-                    "缺少 OPENAI_API_KEY 环境变量（或设置 OPENAI_BASE_URL 指向本地兼容端点）"
+                    "尚未连接模型服务：请在设置页「配置」填写端点与 API 密钥（或设置 OPENAI_BASE_URL 指向本地兼容端点）"
                         .to_string(),
                 )
             }
         };
-        let model =
-            std::env::var("OPENAI_MODEL").unwrap_or_else(|_| "deepseek-v4-flash".to_string());
         let cloud_enabled = std::env::var("OWO_CLOUD_ENABLED")
             .ok()
             .and_then(|value| value.parse::<bool>().ok())
@@ -234,6 +389,118 @@ impl OpenAiCompatibleConfig {
     }
 }
 
+/// 延迟解析的模型 provider：每次调用前重读接入配置（已保存值 > 环境变量 > 默认）。
+///
+/// 存在的理由有两条：
+/// 1. **首启门不能把服务卡死**——未配置时服务仍要能起来，让设置页可访问、可填写；
+/// 2. **保存后即时生效**——设置页写入配置后，下一个回合就用到新端点/密钥，无需重启。
+///
+/// 配置未就绪时返回可读的错误（由前端首启门先行拦截，正常路径走不到这里）。
+///
+/// **provider 选择（A1-1）**：`OWO_PROVIDER=anthropic` 且 `ANTHROPIC_API_KEY`
+/// 可用 → Anthropic 原生（prompt caching / 原生 tool_use / 多模态 image 块）；
+/// 其余情况 → OpenAI-compatible（默认，覆盖 DeepSeek/Ollama/多数代理）。
+pub struct DeferredProvider {
+    cached: std::sync::Mutex<Option<(String, Arc<dyn ModelProvider>)>>,
+}
+
+impl Default for DeferredProvider {
+    fn default() -> Self {
+        Self {
+            cached: std::sync::Mutex::new(None),
+        }
+    }
+}
+
+impl DeferredProvider {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 取当前配置对应的 provider；配置指纹变化则重建（保存设置后自动换新）。
+    fn resolve(&self) -> Result<Arc<dyn ModelProvider>, String> {
+        // 指纹 = provider 种类 + 配置摘要：种类或端点/密钥/模型任一变化即重建。
+        let resolved: (String, Arc<dyn ModelProvider>) = if wants_anthropic() {
+            let config = crate::anthropic::AnthropicConfig::from_env()?;
+            let fingerprint = format!(
+                "anthropic|{}|{}|{}|{}",
+                config.base_url, config.api_key, config.model, config.cloud_enabled
+            );
+            let provider: Arc<dyn ModelProvider> =
+                Arc::new(crate::anthropic::AnthropicProvider::new(config)?);
+            (fingerprint, provider)
+        } else {
+            let config = OpenAiCompatibleConfig::from_env()?;
+            let fingerprint = format!(
+                "openai|{}|{}|{}|{}",
+                config.base_url, config.api_key, config.model, config.cloud_enabled
+            );
+            let provider: Arc<dyn ModelProvider> =
+                Arc::new(OpenAiCompatibleProvider::new(config.clone())?);
+            (fingerprint, provider)
+        };
+        let mut slot = self
+            .cached
+            .lock()
+            .map_err(|_| "provider 缓存锁中毒".to_string())?;
+        if let Some((cached_fingerprint, provider)) = slot.as_ref() {
+            if *cached_fingerprint == resolved.0 {
+                return Ok(Arc::clone(provider));
+            }
+        }
+        *slot = Some((resolved.0.clone(), Arc::clone(&resolved.1)));
+        Ok(resolved.1)
+    }
+}
+
+/// 是否要求 Anthropic 原生通道（`OWO_PROVIDER=anthropic`，大小写不敏感）。
+fn wants_anthropic() -> bool {
+    std::env::var("OWO_PROVIDER")
+        .map(|value| value.trim().eq_ignore_ascii_case("anthropic"))
+        .unwrap_or(false)
+}
+
+#[async_trait::async_trait]
+impl ModelProvider for DeferredProvider {
+    async fn complete(
+        &self,
+        messages: &[ChatMessage],
+        tools: &[ToolSpec],
+    ) -> Result<ModelOutput, String> {
+        self.resolve()?.complete(messages, tools).await
+    }
+
+    async fn complete_stream(
+        &self,
+        messages: &[ChatMessage],
+        tools: &[ToolSpec],
+        on_delta: &mut (dyn FnMut(String) + Send),
+    ) -> Result<ModelOutput, String> {
+        self.resolve()?
+            .complete_stream(messages, tools, on_delta)
+            .await
+    }
+
+    async fn complete_stream_with_reasoning(
+        &self,
+        messages: &[ChatMessage],
+        tools: &[ToolSpec],
+        on_chunk: &mut (dyn FnMut(StreamChunk) + Send),
+    ) -> Result<ModelOutput, String> {
+        self.resolve()?
+            .complete_stream_with_reasoning(messages, tools, on_chunk)
+            .await
+    }
+
+    /// 转发真实 provider 的用量累计（否则外层 ResilientProvider 聚合到零值，
+    /// 回合汇报卡的 token 消耗会一直缺失）。
+    fn usage_snapshot(&self) -> TokenUsage {
+        self.resolve()
+            .map(|provider| provider.usage_snapshot())
+            .unwrap_or_default()
+    }
+}
+
 /// OpenAI-compatible `/chat/completions` 客户端（覆盖 OpenAI、DeepSeek、Ollama、多数代理）。
 pub struct OpenAiCompatibleProvider {
     client: reqwest::Client,
@@ -242,32 +509,51 @@ pub struct OpenAiCompatibleProvider {
     usage: std::sync::Mutex<TokenUsage>,
 }
 
-impl OpenAiCompatibleProvider {
-    pub fn new(config: OpenAiCompatibleConfig) -> Result<Self, String> {
-        let mut builder = reqwest::Client::builder()
-            .connect_timeout(std::time::Duration::from_secs(10))
-            .timeout(std::time::Duration::from_secs(180));
-        let mut has_proxy = false;
-        for name in [
-            "OWO_HTTP_PROXY",
-            "HTTPS_PROXY",
-            "HTTP_PROXY",
-            "https_proxy",
-            "http_proxy",
-        ] {
-            if let Ok(proxy) = std::env::var(name) {
-                if !proxy.trim().is_empty() {
-                    let proxy = reqwest::Proxy::all(proxy)
-                        .map_err(|e| format!("代理配置无效（{name}）：{e}"))?;
-                    builder = builder.proxy(proxy);
-                    has_proxy = true;
-                    break;
+/// 构建模型 HTTP 客户端：代理（OWO_HTTP_PROXY/HTTPS_PROXY/HTTP_PROXY）+
+/// NO_PROXY 排除列表（A1-4：127.0.0.1/localhost 等本地端点必须直连，
+/// 否则配置了 OWO_HTTP_PROXY 后本地兼容端点流量也会被推进代理）。
+pub(crate) fn build_model_http_client(
+    connect_timeout_secs: u64,
+    total_timeout_secs: u64,
+) -> Result<(reqwest::Client, bool), String> {
+    let mut builder = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(connect_timeout_secs))
+        .timeout(std::time::Duration::from_secs(total_timeout_secs));
+    let mut has_proxy = false;
+    for name in [
+        "OWO_HTTP_PROXY",
+        "HTTPS_PROXY",
+        "HTTP_PROXY",
+        "https_proxy",
+        "http_proxy",
+    ] {
+        if let Ok(proxy) = std::env::var(name) {
+            if !proxy.trim().is_empty() {
+                let mut proxy = reqwest::Proxy::all(proxy)
+                    .map_err(|e| format!("代理配置无效（{name}）：{e}"))?;
+                has_proxy = true;
+                let no_proxy = std::env::var("NO_PROXY")
+                    .or_else(|_| std::env::var("no_proxy"))
+                    .unwrap_or_default();
+                if !no_proxy.trim().is_empty() {
+                    if let Some(exclusions) = reqwest::NoProxy::from_string(&no_proxy) {
+                        proxy = proxy.no_proxy(Some(exclusions));
+                    }
                 }
+                builder = builder.proxy(proxy);
+                break;
             }
         }
-        let client = builder
-            .build()
-            .map_err(|e| format!("HTTP 客户端创建失败：{e}"))?;
+    }
+    let client = builder
+        .build()
+        .map_err(|e| format!("HTTP 客户端创建失败：{e}"))?;
+    Ok((client, has_proxy))
+}
+
+impl OpenAiCompatibleProvider {
+    pub fn new(config: OpenAiCompatibleConfig) -> Result<Self, String> {
+        let (client, has_proxy) = build_model_http_client(10, 180)?;
         let direct_client = if has_proxy {
             Some(
                 reqwest::Client::builder()
@@ -373,12 +659,28 @@ impl OpenAiCompatibleProvider {
             .unwrap_or(self.config.cloud_enabled)
     }
 
-    /// 当前模型：优先读运行时环境变量（支持设置页热切换），缺省用启动配置。
+    /// 当前模型：用构造时的配置（`from_env` 已按「设置页保存值 > OPENAI_MODEL > 默认」解析好）。
+    ///
+    /// 这里不再直读环境变量：此前 env 优先级高于配置，导致「设置页选了模型但进程里存在
+    /// OPENAI_MODEL 时永远不生效」（桌面壳还会注入 OPENAI_MODEL=local，症状相同）。
+    /// 热切换依旧成立——`DeferredProvider` 每次调用前重读 `from_env()` 并重建 provider。
     fn model(&self) -> String {
-        std::env::var("OPENAI_MODEL")
-            .ok()
-            .filter(|value| !value.trim().is_empty())
-            .unwrap_or_else(|| self.config.model.clone())
+        self.config.model.clone()
+    }
+
+    /// 推理档位（`reasoning_effort`）：读运行时环境变量（设置页保存后即时生效）。
+    /// 只认 minimal/low/medium/high；未设置或取值非法则返回 None = 不发送该参数，
+    /// 避免不支持它的 OpenAI 兼容端点因为未知字段直接 400。
+    fn reasoning_effort(&self) -> Option<String> {
+        let value = std::env::var("OWO_REASONING_EFFORT")
+            .ok()?
+            .trim()
+            .to_ascii_lowercase();
+        if matches!(value.as_str(), "minimal" | "low" | "medium" | "high") {
+            Some(value)
+        } else {
+            None
+        }
     }
 
     fn request_body(&self, messages: &[ChatMessage], tools: &[ToolSpec], stream: bool) -> Value {
@@ -398,9 +700,27 @@ impl OpenAiCompatibleProvider {
         let messages_payload: Vec<Value> = messages
             .iter()
             .map(|message| {
+                // A1-2 多模态：user 消息带图片时 content 升级为 parts 数组
+                //（其余角色仍为字符串——OpenAI 兼容端点对 tool/system 的
+                // 数组 content 支持不一，图片统一从 user 通道进）。
+                let content_value = if message.role == "user" && !message.images.is_empty() {
+                    let mut parts: Vec<Value> = Vec::new();
+                    if let Some(text) = message.content.as_deref().filter(|t| !t.is_empty()) {
+                        parts.push(json!({ "type": "text", "text": text }));
+                    }
+                    for image in &message.images {
+                        parts.push(json!({
+                            "type": "image_url",
+                            "image_url": { "url": image.url },
+                        }));
+                    }
+                    Value::Array(parts)
+                } else {
+                    json!(message.content)
+                };
                 let mut wire = json!({
                     "role": message.role,
-                    "content": message.content,
+                    "content": content_value,
                 });
                 if let Some(tool_call_id) = &message.tool_call_id {
                     wire["tool_call_id"] = Value::String(tool_call_id.clone());
@@ -437,6 +757,10 @@ impl OpenAiCompatibleProvider {
         if stream {
             body["stream_options"] = json!({ "include_usage": true });
         }
+        // 推理档位只在用户显式选择时才下发（默认请求体与旧版完全一致）。
+        if let Some(effort) = self.reasoning_effort() {
+            body["reasoning_effort"] = Value::String(effort);
+        }
         body
     }
 }
@@ -444,6 +768,8 @@ impl OpenAiCompatibleProvider {
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct StreamDelta {
     pub content: Option<String>,
+    /// 思考增量（DeepSeek `reasoning_content` 等；不写入对话历史）。
+    pub reasoning: Option<String>,
     /// 原始 tool_calls 增量片段（JSON 值）。
     pub tool_call_fragments: Vec<Value>,
     /// 末尾 usage 块（OpenAI-compatible 流式响应在最后一条 data 中给出）。
@@ -463,6 +789,12 @@ pub fn parse_sse_payload(payload: &str) -> Option<StreamDelta> {
         .and_then(Value::as_str)
         .filter(|s| !s.is_empty())
         .map(str::to_string);
+    let reasoning = delta
+        .get("reasoning_content")
+        .or_else(|| delta.get("reasoning"))
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
     let tool_call_fragments = delta
         .get("tool_calls")
         .and_then(Value::as_array)
@@ -472,11 +804,13 @@ pub fn parse_sse_payload(payload: &str) -> Option<StreamDelta> {
         .get("usage")
         .map(parse_usage_value)
         .filter(|usage| usage.total_tokens > 0 || usage.prompt_tokens > 0);
-    if content.is_none() && tool_call_fragments.is_empty() && usage.is_none() {
+    if content.is_none() && reasoning.is_none() && tool_call_fragments.is_empty() && usage.is_none()
+    {
         return None;
     }
     Some(StreamDelta {
         content,
+        reasoning,
         tool_call_fragments,
         usage,
     })
@@ -612,6 +946,22 @@ impl ModelProvider for OpenAiCompatibleProvider {
         tools: &[ToolSpec],
         on_delta: &mut (dyn FnMut(String) + Send),
     ) -> Result<ModelOutput, String> {
+        // 适配器：只转发正文块（思考块被忽略）；真实实现见 complete_stream_with_reasoning。
+        let mut forward = |chunk: StreamChunk| {
+            if let StreamChunk::Content(text) = chunk {
+                on_delta(text);
+            }
+        };
+        self.complete_stream_with_reasoning(messages, tools, &mut forward)
+            .await
+    }
+
+    async fn complete_stream_with_reasoning(
+        &self,
+        messages: &[ChatMessage],
+        tools: &[ToolSpec],
+        on_chunk: &mut (dyn FnMut(StreamChunk) + Send),
+    ) -> Result<ModelOutput, String> {
         if !self.cloud_enabled() {
             return Err("云端模型已禁用（数据出境开关关闭）".to_string());
         }
@@ -643,7 +993,7 @@ impl ModelProvider for OpenAiCompatibleProvider {
                 &mut buffer,
                 &mut content,
                 &mut accumulators,
-                on_delta,
+                on_chunk,
                 &mut saw_sse,
             ) {
                 self.record_usage(&json!({
@@ -667,7 +1017,7 @@ impl ModelProvider for OpenAiCompatibleProvider {
                 &mut buffer,
                 &mut content,
                 &mut accumulators,
-                on_delta,
+                on_chunk,
                 &mut saw_sse,
             ) {
                 self.record_usage(&json!({
@@ -968,7 +1318,30 @@ impl ResilientProvider {
     /// 以显式主配置构造（CLI 接线用，主配置的 model/api_key 已确定）；
     /// fallback 仍读 OWO_MODEL_FALLBACK_BASE_URLS（同 model；本地端点无需 key）。
     pub fn from_config(config: OpenAiCompatibleConfig) -> Result<Self, String> {
-        let primary = Arc::new(OpenAiCompatibleProvider::new(config.clone())?);
+        let primary: Arc<dyn ModelProvider> =
+            Arc::new(OpenAiCompatibleProvider::new(config.clone())?);
+        Self::from_primary(primary, &config)
+    }
+
+    /// 主 provider 延迟解析：每次调用前重读接入配置，因此设置页保存后**下一个回合即生效**，
+    /// 无需重启服务。未配置时也不会让启动失败（错误在调用点才暴露，由前端首启门先行拦截）。
+    /// fallback 仍读 OWO_MODEL_FALLBACK_BASE_URLS。
+    pub fn from_deferred() -> Self {
+        // 配置未就绪时用空种子构造 fallback 链；真正的主 provider 是 DeferredProvider。
+        let seed = OpenAiCompatibleConfig::from_env().unwrap_or_else(|_| OpenAiCompatibleConfig {
+            base_url: String::new(),
+            api_key: String::new(),
+            model: std::env::var("OPENAI_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.to_string()),
+            cloud_enabled: true,
+        });
+        Self::from_primary(Arc::new(DeferredProvider::new()), &seed)
+            .expect("fallback 链构造不应失败")
+    }
+
+    fn from_primary(
+        primary: Arc<dyn ModelProvider>,
+        config: &OpenAiCompatibleConfig,
+    ) -> Result<Self, String> {
         let mut fallbacks: Vec<Arc<dyn ModelProvider>> = Vec::new();
         if let Ok(urls) = std::env::var("OWO_MODEL_FALLBACK_BASE_URLS") {
             for url in urls.split(',').map(str::trim).filter(|s| !s.is_empty()) {
@@ -1040,6 +1413,60 @@ impl ResilientProvider {
         }
         total
     }
+
+    /// 流式调用内核：实时转发增量（用户能立即看到思考/正文），
+    /// 尚未产生任何输出时按重试策略重试/降级；一旦已发出增量则不再重试，
+    /// 避免重复前缀（如思考流前几个字再次出现）。
+    async fn complete_stream_inner(
+        &self,
+        messages: &[ChatMessage],
+        tools: &[ToolSpec],
+        on_chunk: &mut (dyn FnMut(StreamChunk) + Send),
+    ) -> Result<ModelOutput, String> {
+        if !self.breaker.allow_request() {
+            return Err(format!(
+                "模型网关熔断器打开（连续失败 {} 次），请稍后重试",
+                self.breaker.consecutive_failures()
+            ));
+        }
+        let mut errors: Vec<String> = Vec::new();
+        let mut retriable_seen = false;
+        for provider in self.providers() {
+            let mut attempt = 0;
+            let outcome = loop {
+                let mut produced = false;
+                let mut forward_mut: &mut (dyn FnMut(StreamChunk) + Send) =
+                    &mut |chunk: StreamChunk| {
+                        produced = true;
+                        on_chunk(chunk);
+                    };
+                let result = provider
+                    .complete_stream_with_reasoning(messages, tools, &mut forward_mut)
+                    .await;
+                match result {
+                    Ok(output) => {
+                        self.breaker.record_success();
+                        return Ok(output);
+                    }
+                    Err(error) => {
+                        let retriable = is_retriable(&error, &self.retry);
+                        if produced || !retriable || attempt >= self.retry.max_retries {
+                            break (error, retriable);
+                        }
+                        tokio::time::sleep(self.retry.delay_for(attempt)).await;
+                        attempt += 1;
+                    }
+                }
+            };
+            errors.push(outcome.0);
+            retriable_seen = retriable_seen || outcome.1;
+            if !outcome.1 {
+                break;
+            }
+        }
+        self.breaker.record_failure();
+        Err(format!("模型网关全部失败：{}", errors.join("；")))
+    }
 }
 
 #[async_trait]
@@ -1083,52 +1510,23 @@ impl ModelProvider for ResilientProvider {
         tools: &[ToolSpec],
         on_delta: &mut (dyn FnMut(String) + Send),
     ) -> Result<ModelOutput, String> {
-        if !self.breaker.allow_request() {
-            return Err(format!(
-                "模型网关熔断器打开（连续失败 {} 次），请稍后重试",
-                self.breaker.consecutive_failures()
-            ));
-        }
-        let mut errors: Vec<String> = Vec::new();
-        let mut retriable_seen = false;
-        for provider in self.providers() {
-            // 空闲看门狗/网络失败自动重连或降级：整条消息重试（已发增量无法撤回，
-            // 但避免静默失败；预算/出境类错误不降级）。
-            let mut attempt = 0;
-            let outcome = loop {
-                let mut deltas: Vec<String> = Vec::new();
-                let mut forward = |delta: String| deltas.push(delta);
-                let mut forward_mut: &mut (dyn FnMut(String) + Send) = &mut forward;
-                match provider
-                    .complete_stream(messages, tools, &mut forward_mut)
-                    .await
-                {
-                    Ok(output) => {
-                        // 整条成功后才回放增量，避免重试造成重复内容。
-                        for delta in deltas {
-                            on_delta(delta);
-                        }
-                        self.breaker.record_success();
-                        return Ok(output);
-                    }
-                    Err(error) => {
-                        let retriable = is_retriable(&error, &self.retry);
-                        if !retriable || attempt >= self.retry.max_retries {
-                            break (error, retriable);
-                        }
-                        tokio::time::sleep(self.retry.delay_for(attempt)).await;
-                        attempt += 1;
-                    }
-                }
-            };
-            errors.push(outcome.0);
-            retriable_seen = retriable_seen || outcome.1;
-            if !outcome.1 {
-                break;
+        // 适配器：只转发正文块（思考块被忽略）。
+        let mut forward = |chunk: StreamChunk| {
+            if let StreamChunk::Content(text) = chunk {
+                on_delta(text);
             }
-        }
-        self.breaker.record_failure();
-        Err(format!("模型网关全部失败：{}", errors.join("；")))
+        };
+        self.complete_stream_inner(messages, tools, &mut forward)
+            .await
+    }
+
+    async fn complete_stream_with_reasoning(
+        &self,
+        messages: &[ChatMessage],
+        tools: &[ToolSpec],
+        on_chunk: &mut (dyn FnMut(StreamChunk) + Send),
+    ) -> Result<ModelOutput, String> {
+        self.complete_stream_inner(messages, tools, on_chunk).await
     }
 
     fn usage_snapshot(&self) -> TokenUsage {
@@ -1178,7 +1576,7 @@ fn consume_stream_buffer(
     buffer: &mut String,
     content: &mut String,
     accumulators: &mut HashMap<usize, ToolCallAccumulator>,
-    on_delta: &mut (dyn FnMut(String) + Send),
+    on_chunk: &mut (dyn FnMut(StreamChunk) + Send),
     saw_sse: &mut bool,
 ) -> Option<TokenUsage> {
     let mut usage = None;
@@ -1196,9 +1594,12 @@ fn consume_stream_buffer(
             if delta.usage.is_some() {
                 usage = delta.usage;
             }
+            if let Some(reasoning) = delta.reasoning {
+                on_chunk(StreamChunk::Reasoning(reasoning));
+            }
             if let Some(delta_content) = delta.content {
                 content.push_str(&delta_content);
-                on_delta(delta_content);
+                on_chunk(StreamChunk::Content(delta_content));
             }
             accumulate_tool_fragments(accumulators, &delta.tool_call_fragments);
         }
@@ -1404,6 +1805,38 @@ mod tests {
     }
 
     #[test]
+    fn request_body_sends_reasoning_effort_only_for_known_levels() {
+        let _guard = crate::ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let provider = OpenAiCompatibleProvider::new(OpenAiCompatibleConfig {
+            base_url: "http://127.0.0.1:11434/v1".to_string(),
+            api_key: String::new(),
+            model: "local".to_string(),
+            cloud_enabled: false,
+        })
+        .unwrap();
+
+        // 默认（未选择档位）：请求体与旧版完全一致，不新增字段。
+        std::env::remove_var("OWO_REASONING_EFFORT");
+        let body = provider.request_body(&[], &[], false);
+        assert!(
+            body.get("reasoning_effort").is_none(),
+            "默认不应下发推理档位"
+        );
+
+        std::env::set_var("OWO_REASONING_EFFORT", " HIGH ");
+        let body = provider.request_body(&[], &[], false);
+        assert_eq!(body["reasoning_effort"], "high");
+
+        // 非法取值不下发：宁可回落模型默认，也不让端点因未知字段报错。
+        std::env::set_var("OWO_REASONING_EFFORT", "unsupported");
+        let body = provider.request_body(&[], &[], false);
+        assert!(body.get("reasoning_effort").is_none(), "非法取值不应下发");
+        std::env::remove_var("OWO_REASONING_EFFORT");
+    }
+
+    #[test]
     fn utf8_chunks_are_reassembled_without_replacement_characters() {
         let mut buffer = String::new();
         let mut pending = Vec::new();
@@ -1415,22 +1848,53 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn model_switch_applies_without_reconstruction() {
+    async fn model_selection_prefers_config_and_hot_switches_via_config() {
         let _guard = ENV_LOCK.lock().await;
         std::env::set_var("OPENAI_API_KEY", "test");
         std::env::set_var("OPENAI_BASE_URL", "http://127.0.0.1:9");
         std::env::set_var("OPENAI_MODEL", "model-a");
         std::env::remove_var("OWO_CLOUD_ENABLED");
+
+        // ① 已构造的 provider 用配置里的模型；env 后改不再压过它。
+        // 旧行为是 request_body 每次直读 OPENAI_MODEL，导致设置页/--model 选的模型永远被 env 覆盖。
         let config = OpenAiCompatibleConfig::from_env().unwrap();
         let provider = OpenAiCompatibleProvider::new(config).unwrap();
         let body = provider.request_body(&[], &[], false);
         assert_eq!(body["model"], "model-a");
         std::env::set_var("OPENAI_MODEL", "model-b");
         let body = provider.request_body(&[], &[], false);
-        assert_eq!(body["model"], "model-b");
-        std::env::set_var("OPENAI_MODEL", "");
-        let body = provider.request_body(&[], &[], false);
-        assert_eq!(body["model"], "model-a");
+        assert_eq!(
+            body["model"], "model-a",
+            "已构造的 provider 不应被 env 改动影响"
+        );
+
+        // ② 取值优先级：CLI `--model`（显式覆盖）> 设置页保存值 > OPENAI_MODEL > 内置默认。
+        // 热切换靠 DeferredProvider 每次调用重读本函数并重建 provider（无需重启）。
+        set_provider_override(None, None, Some("model-settings".to_string()));
+        let from_override = OpenAiCompatibleConfig::from_env().unwrap();
+        assert_eq!(
+            from_override.model, "model-settings",
+            "保存值应优先于 OPENAI_MODEL"
+        );
+        set_model_override("model-cli");
+        // 之后再保存设置也不该把它冲掉（CLI 里 build_agent 会再调一次 apply_provider_override）。
+        set_provider_override(None, None, Some("model-settings-2".to_string()));
+        let from_cli = OpenAiCompatibleConfig::from_env().unwrap();
+        assert_eq!(
+            from_cli.model, "model-cli",
+            "--model 应压过保存值且不被后续保存覆盖"
+        );
+        clear_model_override();
+        set_provider_override(None, None, None);
+        let from_env_only = OpenAiCompatibleConfig::from_env().unwrap();
+        assert_eq!(
+            from_env_only.model, "model-b",
+            "没有保存值时回退 OPENAI_MODEL"
+        );
+        std::env::remove_var("OPENAI_MODEL");
+        let from_default = OpenAiCompatibleConfig::from_env().unwrap();
+        assert_eq!(from_default.model, DEFAULT_MODEL, "都没有时用内置默认");
+
         std::env::remove_var("OWO_CLOUD_ENABLED");
         std::env::remove_var("OPENAI_API_KEY");
         std::env::remove_var("OPENAI_BASE_URL");

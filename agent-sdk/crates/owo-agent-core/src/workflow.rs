@@ -42,6 +42,9 @@ pub enum TriggerKind {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WorkflowTrigger {
     pub id: String,
+    /// 内联展开：JSON 形如 `{"id":"t1","kind":"manual"}`（与步骤枚举的扁平风格一致，
+    /// 避免 `kind` 字段与枚举自身 tag 叠成 `{"kind":{"kind":"manual"}}` 的双层嵌套）。
+    #[serde(flatten)]
     pub kind: TriggerKind,
 }
 

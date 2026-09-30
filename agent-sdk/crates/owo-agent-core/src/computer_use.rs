@@ -11,7 +11,6 @@ use crate::tools::{required_string, resolve_session_path, ToolContext, ToolSpec}
 use crate::Tool;
 use async_trait::async_trait;
 use serde_json::{json, Value};
-use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -2045,15 +2044,29 @@ fn node_runtime() -> (String, Option<String>) {
         };
         return (node, node_path);
     }
-    const FALLBACK_NODE: &str = r"C:\Users\23843\.cache\codex-runtimes\codex-primary-runtime\dependencies\node\bin\node.exe";
-    const FALLBACK_NODE_PATH: &str = r"C:\Users\23843\.cache\codex-runtimes\codex-primary-runtime\dependencies\node\node_modules";
-    if Path::new(FALLBACK_NODE).exists() {
-        return (
-            FALLBACK_NODE.to_string(),
-            Some(FALLBACK_NODE_PATH.to_string()),
-        );
+    // 数据目录下的 runtime（推荐部署方式，无需任何环境变量）：
+    //   npm install playwright --prefix "<LOCALAPPDATA>\OwO\Agent\runtime"
+    // 装好后浏览器驱动用系统 Edge（channel=msedge），不必下载浏览器二进制。
+    if let Some(node_path) = data_runtime_node_modules() {
+        return ("node".to_string(), Some(node_path));
     }
     ("node".to_string(), None)
+}
+
+/// `<data_root>/runtime/node_modules`（存在时返回，供 `require("playwright")` 解析）。
+fn data_runtime_node_modules() -> Option<String> {
+    let root = std::env::var("OWO_AGENT_DATA")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            std::env::var("LOCALAPPDATA")
+                .ok()
+                .map(|dir| format!("{dir}\\OwO\\Agent"))
+        })?;
+    let modules = std::path::PathBuf::from(root)
+        .join("runtime")
+        .join("node_modules");
+    modules.is_dir().then(|| modules.display().to_string())
 }
 
 macro_rules! browser_tool {

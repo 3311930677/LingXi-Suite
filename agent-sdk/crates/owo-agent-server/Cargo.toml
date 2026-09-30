@@ -4,9 +4,14 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = ["native-inference"]
+# 透传本地推理开关，供 `--no-default-features` 在无 MSVC 工具链的机器上构建。
+native-inference = ["owo-agent-core/native-inference"]
+
 [dependencies]
 owo-agent-protocol.workspace = true
-owo-agent-core.workspace = true
+owo-agent-core = { workspace = true, default-features = false }
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true

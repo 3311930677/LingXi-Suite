@@ -98,6 +98,20 @@ fn pid_file_cleans_on_drop_and_recovers_stale() {
     );
     assert!(!temp.path().join("server.pid").exists(), "强杀残留应被清理");
 
+    // pid 被无关进程（本测试进程自身）复用：不得误挡启动。
+    // 曾实测：强杀后 pid 文件残留、OpenProcess 对权限不足返回 ACCESS_DENIED 被保守判为存活，
+    // 服务重启被误挡「检测到运行中的服务」。
+    let self_pid = std::process::id();
+    std::fs::write(temp.path().join("server.pid"), self_pid.to_string()).unwrap();
+    let recovery = owo_agent_server::shutdown::recover_force_kill(temp.path()).unwrap();
+    assert_eq!(
+        recovery,
+        Some(ForceKillRecovery {
+            stale_pid: Some(self_pid),
+            cleaned: true,
+        })
+    );
+
     // 无 pid 文件 → None。
     assert!(owo_agent_server::shutdown::recover_force_kill(temp.path())
         .unwrap()

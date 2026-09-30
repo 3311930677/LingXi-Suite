@@ -136,7 +136,8 @@ async fn run_case(
     _started: Instant,
 ) -> CaseResult {
     let policy = Policy::new(workspace.to_path_buf());
-    let registry = ToolRegistry::new();
+    // 评测用无桌面工具集：桌面/浏览器工具会真实操作本机（弹窗、注入），属副作用。
+    let registry = ToolRegistry::headless();
     let agent = Agent::new(provider, registry, policy, AgentConfig::default());
     let mut session = Session::new(workspace, model, None);
     let abort = AtomicBool::new(false);

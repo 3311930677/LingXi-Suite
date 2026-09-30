@@ -14,4 +14,8 @@ pub enum AgentError {
     Tool(String),
     #[error("agent aborted by user")]
     Aborted,
+    /// Hooks 系统阻断（A2-1）：PreToolUse / UserPromptSubmit 的 exit 2 语义，
+    /// stderr 原样回喂模型与用户。
+    #[error("hook 阻断：{0}")]
+    HookBlocked(String),
 }

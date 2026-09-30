@@ -2,8 +2,6 @@
 //!
 //! 独立编译：`#[path = "../src/usage.rs"] mod usage;`（usage.rs 不引用 crate::/super::）。
 
-use std::path::Path;
-
 #[path = "../src/usage.rs"]
 mod usage;
 
@@ -19,6 +17,14 @@ fn budget_exceeded_sets_hard_stop_immediately() {
     assert!(store.is_hard_stopped(), "预算超限当次必须置位硬熔断");
     assert!(store.hard_stop_reason().is_some());
     assert!(store.check_budget(), "check_budget 应反映熔断");
+}
+
+/// 串行锁：`summary_aggregates_*` / `persist_load_*` 共用 `usage::global()` 单例，
+/// 并行执行会互相 reset 污染；串行化后可重复运行。
+static GLOBAL_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn global_lock() -> std::sync::MutexGuard<'static, ()> {
+    GLOBAL_LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 #[test]
@@ -43,6 +49,7 @@ fn topup_recovers_hard_stop() {
 
 #[test]
 fn summary_aggregates_four_dimensions_and_budget_state() {
+    let _guard = global_lock();
     usage::reset_global_for_test();
     let store = usage::global();
     store.set_budget(UsageDimension::Session, 10.0);
@@ -68,6 +75,7 @@ fn summary_aggregates_four_dimensions_and_budget_state() {
 
 #[test]
 fn persist_load_restores_records_budgets_and_hard_stop() {
+    let _guard = global_lock();
     usage::reset_global_for_test();
     let dir = std::env::temp_dir().join(format!("owo-usage-t-{}", uuid::Uuid::new_v4()));
     let store = usage::global();

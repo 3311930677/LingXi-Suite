@@ -122,6 +122,9 @@ async fn mcp_tools_are_registered_and_callable() {
         subagent: None,
         skills: &skills,
         elements: &elements,
+        questioner: None,
+        fanout: None,
+        abort: None,
     };
     let result = registry
         .execute("test_echo", &mut context, json!({ "text": "ok" }))
@@ -530,6 +533,9 @@ async fn mcp_compacted_tool_still_callable() {
         subagent: None,
         skills: &skills,
         elements: &elements,
+        questioner: None,
+        fanout: None,
+        abort: None,
     };
     let result = registry
         .execute(
@@ -542,4 +548,147 @@ async fn mcp_compacted_tool_still_callable() {
     assert_eq!(result["text"], "延迟加载");
     let _ = std::fs::remove_dir_all(&workspace);
     let _ = client.lock().await.shutdown().await;
+}
+
+/// A2-2：resources/prompts 能力协商、读取往返，以及泛化工具注册与调用。
+#[tokio::test]
+async fn mcp_resources_and_prompts_roundtrip_and_tools() {
+    let mut client = McpClient::connect(&test_config()).await.unwrap();
+    // 连接时按能力协商拉取（mock 声明了 resources/prompts）。
+    let resources = client.resources();
+    assert!(
+        resources.iter().any(|resource| resource.uri == "file:///readme.md"),
+        "{resources:?}"
+    );
+    assert!(resources.iter().any(|resource| resource.name == "tips"));
+    let read = client.read_resource("file:///readme.md").await.unwrap();
+    assert!(read["contents"][0]["text"]
+        .as_str()
+        .unwrap()
+        .contains("欢迎"));
+    let error = client.read_resource("file:///missing.md").await.unwrap_err();
+    assert!(error.contains("未知资源"), "{error}");
+
+    let prompts = client.prompts();
+    assert!(prompts.iter().any(|prompt| prompt.name == "summarize"), "{prompts:?}");
+    let prompt = client
+        .get_prompt("summarize", Some(json!({ "topic": "构建" })))
+        .await
+        .unwrap();
+    assert!(prompt["messages"][0]["content"]["text"]
+        .as_str()
+        .unwrap()
+        .contains("构建"));
+
+    // 泛化工具注册：test_read_resource / test_get_prompt。
+    let client = Arc::new(tokio::sync::Mutex::new(client));
+    let mut registry = ToolRegistry::new();
+    registry.register_mcp_extras(
+        "test",
+        Arc::clone(&client),
+        vec![owo_agent_core::McpResource {
+            uri: "file:///readme.md".into(),
+            name: "readme".into(),
+            description: String::new(),
+            mime_type: None,
+        }],
+        vec![owo_agent_core::McpPrompt {
+            name: "summarize".into(),
+            description: String::new(),
+            arguments: Vec::new(),
+        }],
+    );
+    let specs = registry.specs();
+    let resource_spec = specs
+        .iter()
+        .find(|spec| spec.name == "test_read_resource")
+        .expect("资源工具应注册");
+    assert!(
+        resource_spec.description.contains("file:///readme.md"),
+        "目录应进描述：{}",
+        resource_spec.description
+    );
+    assert!(specs.iter().any(|spec| spec.name == "test_get_prompt"));
+
+    // 经 ToolContext 实际调用资源工具。
+    let workspace =
+        std::env::temp_dir().join(format!("owo-mcp-extras-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&workspace).unwrap();
+    let mut session = Session::new(&workspace, "mock", None);
+    let policy = Policy::new(&workspace);
+    let audit = Arc::new(std::sync::Mutex::new(AuditLog::default()));
+    let skills = SkillRegistry::default();
+    let elements = Arc::new(std::sync::Mutex::new(owo_agent_core::ElementRegistry::new()));
+    let mut context = ToolContext {
+        workspace: &workspace,
+        policy: &policy,
+        session: &mut session,
+        audit: &audit,
+        subagent: None,
+        skills: &skills,
+        elements: &elements,
+        questioner: None,
+        fanout: None,
+        abort: None,
+    };
+    let result = registry
+        .execute(
+            "test_read_resource",
+            &mut context,
+            json!({ "uri": "file:///readme.md" }),
+        )
+        .await
+        .unwrap();
+    assert!(result["contents"][0]["text"]
+        .as_str()
+        .unwrap()
+        .contains("欢迎"));
+    let _ = std::fs::remove_dir_all(&workspace);
+    let _ = client.lock().await.shutdown().await;
+}
+
+/// A2-2：Agent 热连接后可见工具包含 resources/prompts 泛化工具。
+#[tokio::test]
+async fn agent_connect_registers_mcp_extras_tools() {
+    use owo_agent_core::agent::Agent;
+
+    struct FixedProvider;
+    #[async_trait]
+    impl ModelProvider for FixedProvider {
+        async fn complete(
+            &self,
+            _messages: &[ChatMessage],
+            _tools: &[ToolSpec],
+        ) -> Result<ModelOutput, String> {
+            Ok(ModelOutput::Text("ok".to_string()))
+        }
+    }
+
+    let workspace =
+        std::env::temp_dir().join(format!("owo-mcp-extras-agent-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&workspace).unwrap();
+    let agent = Agent::new(
+        Arc::new(FixedProvider),
+        ToolRegistry::new(),
+        Policy::new(&workspace),
+        owo_agent_core::AgentConfig::default(),
+    );
+    let count = agent.connect_mcp_server(&test_config()).await.unwrap();
+    assert!(count >= 3, "至少 echo/add/hang 三个工具");
+    let visible: Vec<String> = agent
+        .visible_tool_specs()
+        .iter()
+        .map(|spec| spec.name.clone())
+        .collect();
+    assert!(visible.iter().any(|name| name == "test_echo"), "{visible:?}");
+    assert!(
+        visible.iter().any(|name| name == "test_read_resource"),
+        "{visible:?}"
+    );
+    assert!(
+        visible.iter().any(|name| name == "test_get_prompt"),
+        "{visible:?}"
+    );
+    agent.shutdown_mcp_server("test").await.unwrap();
+    let _ = std::fs::remove_dir_all(&workspace);
 }

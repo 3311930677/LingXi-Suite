@@ -1,9 +1,9 @@
 //! OpenCode 式全屏 TUI（ratatui + crossterm）。
 
 use crate::{
-    apply_disabled_skills, build_agent_with_mcp, builtin_skills_root, connect_mcp_clients,
-    display_path, ensure_data_root, load_mcp_configs, resolve_model, save_mcp_configs,
-    AGENTS_TEMPLATE,
+    apply_approval_scope, apply_disabled_skills, build_agent_with_mcp, builtin_skills_root,
+    connect_mcp_clients, display_path, ensure_data_root, load_mcp_configs, resolve_model,
+    save_mcp_configs, ApprovalScope, AGENTS_TEMPLATE,
 };
 use async_trait::async_trait;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -17,9 +17,9 @@ use owo_agent_core::{
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
@@ -47,9 +47,19 @@ pub fn run(args: TuiArgs) -> Result<(), Box<dyn std::error::Error>> {
         .enable_all()
         .build()?;
     let workspace = args.workspace.canonicalize()?;
-    let settings = Settings::load(&workspace);
+    let settings =
+        Settings::load_encrypted(&workspace).unwrap_or_else(|_| Settings::load(&workspace));
     crate::apply_egress_setting(&settings);
+    // 与 turn/serve/repl 对齐：设置里的用量、推理档位与接入配置要写进进程环境，
+    // 否则在 TUI 里改这些设置只落盘、不生效（此前 TUI 只调用了 apply_egress_setting）。
+    settings.apply_usage_env();
+    settings.apply_reasoning_env();
+    settings.apply_provider_override();
+    let explicit_model = args.model.is_some();
     let model = resolve_model(args.model, settings.model.as_deref());
+    if explicit_model {
+        owo_agent_core::gateway::set_model_override(model.clone());
+    }
     let read_only = args.agent == "plan" || settings.read_only;
     let root = ensure_data_root(args.data_dir, &workspace);
     let store = SqliteSessionStore::open(&root.join("index.db"))?;
@@ -79,6 +89,7 @@ pub fn run(args: TuiArgs) -> Result<(), Box<dyn std::error::Error>> {
         &mcp_clients,
         &skills,
         &settings.deny_commands,
+        &settings.permissions.rules,
     )?);
     let mut app = TuiApp::new(
         workspace,
@@ -102,10 +113,21 @@ pub fn run(args: TuiArgs) -> Result<(), Box<dyn std::error::Error>> {
     result
 }
 
-type PendingApprovals = Arc<Mutex<HashMap<String, Sender<Decision>>>>;
+type PendingApprovals = Arc<Mutex<HashMap<String, Sender<ApprovalScope>>>>;
+
+/// 待审批详情（A6-1 弹窗展示）。
+struct PendingApprovalInfo {
+    tool: String,
+    level: String,
+    reason: String,
+    args: String,
+}
 
 struct TuiApprover {
     pending: PendingApprovals,
+    /// 把「本会话/总是允许」写进 Agent 策略（与 REPL 共用 `apply_approval_scope`）。
+    agent: Arc<Agent>,
+    workspace: PathBuf,
 }
 
 #[async_trait]
@@ -117,7 +139,9 @@ impl Approver for TuiApprover {
         }
         let deadline = std::time::Instant::now() + Duration::from_secs(300);
         loop {
-            if let Ok(decision) = rx.try_recv() {
+            if let Ok(scope) = rx.try_recv() {
+                let (decision, _note) =
+                    apply_approval_scope(&self.agent, &self.workspace, request, scope);
                 return decision;
             }
             if std::time::Instant::now() >= deadline {
@@ -148,9 +172,15 @@ struct TuiApp {
     agent: Arc<Agent>,
     abort: Arc<AtomicBool>,
     pending: PendingApprovals,
-    pending_order: Vec<String>,
+    /// 待审批请求 id（FIFO——此前是 Vec + pop()，多请求时会先处理最后一条）。
+    pending_order: VecDeque<String>,
+    /// 与 `pending_order` 同序的详情（弹窗展示）。
+    pending_info: VecDeque<PendingApprovalInfo>,
     event_rx: Option<Receiver<TuiMsg>>,
     input: String,
+    /// B3：输入历史（↑/↓ 翻找）。
+    history: Vec<String>,
+    history_index: Option<usize>,
     transcript: Vec<(String, Style)>,
     diff_view: Vec<(String, Style)>,
     show_diff_panel: bool,
@@ -199,11 +229,14 @@ impl TuiApp {
             agent,
             abort: Arc::new(AtomicBool::new(false)),
             pending: Arc::new(Mutex::new(HashMap::new())),
-            pending_order: Vec::new(),
+            pending_order: VecDeque::new(),
+            pending_info: VecDeque::new(),
             event_rx: None,
             input: String::new(),
+            history: Vec::new(),
+            history_index: None,
             transcript: vec![(
-                "OwO Agent TUI — 输入文字开始任务，Tab 切换 build/plan，Ctrl+C 中止/退出，/help 查看命令"
+                "OwO Agent TUI — 输入文字开始任务；Tab 补全，F2 切换 build/plan，↑/↓ 历史，Shift+Enter 换行，Ctrl+C 中止/退出，/help 查看命令"
                     .to_string(),
                 dim(),
             )],
@@ -363,7 +396,11 @@ impl TuiApp {
 
         let status_line = Line::from(vec![
             Span::styled(" Tab ", Style::default().fg(self.theme.accent)),
+            Span::raw("补全 "),
+            Span::styled(" F2 ", Style::default().fg(self.theme.accent)),
             Span::raw("模式 "),
+            Span::styled(" Shift+Enter ", Style::default().fg(self.theme.accent)),
+            Span::raw("换行 "),
             Span::styled(" Ctrl+C ", Style::default().fg(self.theme.accent)),
             Span::raw("中止/退出 "),
             Span::styled(" PgUp/PgDn ", Style::default().fg(self.theme.accent)),
@@ -371,6 +408,40 @@ impl TuiApp {
             Span::styled(&self.status, Style::default().fg(Color::Yellow)),
         ]);
         frame.render_widget(Paragraph::new(status_line), chunks[3]);
+
+        // A6-1：审批弹窗（模态）——档位/工具/原因/入参一屏可读，多请求逐条处理。
+        if let Some(info) = self.pending_info.front() {
+            let popup = centered_rect(area, 74, 46);
+            frame.render_widget(Clear, popup);
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Yellow))
+                .title(format!(" 需要审批（待处理 {}） ", self.pending_info.len()));
+            let body = vec![
+                Line::from(vec![
+                    Span::styled("档位 ", dim()),
+                    Span::styled(info.level.clone(), Style::default().fg(Color::Yellow)),
+                    Span::raw("   工具 "),
+                    Span::styled(info.tool.clone(), Style::default().fg(self.theme.accent)),
+                ]),
+                Line::from(vec![
+                    Span::styled("原因 ", dim()),
+                    Span::raw(info.reason.clone()),
+                ]),
+                Line::from(""),
+                Line::from(Span::styled("入参", dim())),
+                Line::from(info.args.clone()),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "y = 允许一次    a = 本会话内允许    s = 总是允许    n = 拒绝",
+                    Style::default().fg(Color::Green),
+                )),
+            ];
+            frame.render_widget(
+                Paragraph::new(body).block(block).wrap(Wrap { trim: false }),
+                popup,
+            );
+        }
     }
 
     fn visible_lines_of(&self, source: &[(String, Style)], height: usize) -> Vec<(String, Style)> {
@@ -397,8 +468,18 @@ impl TuiApp {
         }
         if self.running {
             match key.code {
-                KeyCode::Char('y' | 'Y') => self.respond_approval(true),
-                KeyCode::Char('n' | 'N') => self.respond_approval(false),
+                // A6-1 三档授权：y=一次 / a=本会话内 / s=总是 / n=拒绝。
+                KeyCode::Char(c) if matches!(c.to_ascii_lowercase(), 'y' | 'a' | 's' | 'n') => {
+                    if !self.pending_order.is_empty() {
+                        let scope = match c.to_ascii_lowercase() {
+                            'y' => ApprovalScope::Once,
+                            'a' => ApprovalScope::Session,
+                            's' => ApprovalScope::Always,
+                            _ => ApprovalScope::Deny,
+                        };
+                        self.respond_approval(scope);
+                    }
+                }
                 _ if self.matches("abort", &key) => {
                     self.abort.store(true, Ordering::Relaxed);
                     self.push_system("正在中止当前回合…".to_string(), yellow());
@@ -409,7 +490,18 @@ impl TuiApp {
         }
 
         match key.code {
+            // B3：Shift+Enter（或 Ctrl+J）插入换行（多行输入）；Enter 提交。
+            KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                self.input.push('\n');
+            }
+            KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.input.push('\n');
+            }
             KeyCode::Enter => self.submit(runtime)?,
+            // B3：Tab 补全（/命令与 @路径）；↑/↓ 翻输入历史。
+            KeyCode::Tab => self.complete_input(),
+            KeyCode::Up => self.history_prev(),
+            KeyCode::Down => self.history_next(),
             _ if self.matches("abort", &key) => {
                 return Ok(true);
             }
@@ -452,6 +544,70 @@ impl TuiApp {
             .unwrap_or(false)
     }
 
+    /// B3：Tab 补全——唯一候选直接补全，多候选补到最长公共前缀并在状态栏列出。
+    fn complete_input(&mut self) {
+        let text = self.input.clone();
+        let start = text
+            .rfind(char::is_whitespace)
+            .map(|index| index + 1)
+            .unwrap_or(0);
+        let token = &text[start..];
+        if token.is_empty() {
+            return;
+        }
+        let candidates = crate::completion_candidates(token);
+        let Some(first) = candidates.first() else {
+            return;
+        };
+        let completion = if candidates.len() == 1 {
+            first.clone()
+        } else {
+            let prefix = crate::longest_common_prefix(&candidates);
+            if prefix.len() <= token.len() {
+                let preview: Vec<String> = candidates.iter().take(6).cloned().collect();
+                self.status = format!(
+                    "{} 个候选：{}{}",
+                    candidates.len(),
+                    preview.join("  "),
+                    if candidates.len() > preview.len() { "  …" } else { "" }
+                );
+                return;
+            }
+            prefix
+        };
+        self.input.truncate(start);
+        self.input.push_str(&completion);
+        self.status = "已补全".to_string();
+    }
+
+    /// B3：↑ 翻到更早的输入。
+    fn history_prev(&mut self) {
+        if self.history.is_empty() {
+            return;
+        }
+        let index = match self.history_index {
+            Some(index) => index.saturating_sub(1),
+            None => self.history.len() - 1,
+        };
+        self.history_index = Some(index);
+        self.input = self.history[index].clone();
+    }
+
+    /// B3：↓ 翻到更近的输入（越界清空回新输入）。
+    fn history_next(&mut self) {
+        match self.history_index {
+            Some(index) if index + 1 < self.history.len() => {
+                self.history_index = Some(index + 1);
+                self.input = self.history[index + 1].clone();
+            }
+            Some(_) => {
+                self.history_index = None;
+                self.input.clear();
+            }
+            None => {}
+        }
+    }
+
     fn submit(
         &mut self,
         runtime: &tokio::runtime::Runtime,
@@ -461,6 +617,14 @@ impl TuiApp {
         if line.is_empty() {
             return Ok(());
         }
+        // B3：输入历史（↑/↓ 翻找；上限 200 条，去重连续重复）。
+        if self.history.last().map(String::as_str) != Some(line.as_str()) {
+            self.history.push(line.clone());
+            if self.history.len() > 200 {
+                self.history.remove(0);
+            }
+        }
+        self.history_index = None;
         if let Some(query) = line.strip_prefix("@explore ") {
             self.run_at_subagent(runtime, query, true)?;
             return Ok(());
@@ -539,12 +703,18 @@ impl TuiApp {
         self.event_rx = Some(rx);
         let no_approval = self.no_approval;
         let prompt_owned = prompt.to_string();
+        let approver_agent = Arc::clone(&self.agent);
+        let approver_workspace = self.workspace.clone();
         runtime.spawn(async move {
             let approver = if no_approval {
                 Box::new(owo_agent_core::permissions::AutoApprover { allow: true })
                     as Box<dyn Approver>
             } else {
-                Box::new(TuiApprover { pending }) as Box<dyn Approver>
+                Box::new(TuiApprover {
+                    pending,
+                    agent: approver_agent,
+                    workspace: approver_workspace,
+                }) as Box<dyn Approver>
             };
             let mut on_event = |event: &TurnEvent| {
                 let _ = tx.send(TuiMsg::Event(event.clone()));
@@ -590,13 +760,18 @@ impl TuiApp {
                                 .unwrap_or(0);
                             self.push_system(
                                 format!(
-                                    "✓ 完成：工具 {steps} 步，改动 {changed} 个文件（/diff 查看，/undo 回滚）"
+                                    "✓ 完成：工具 {steps} 步，改动 {changed} 个文件（/diff 查看，/undo 回滚）· {}",
+                                    crate::turn_stats(&outcome)
                                 ),
                                 green(),
                             );
                             if let Some(text) = &final_text {
                                 self.push_line("── 结果 ──".to_string(), bold());
-                                self.push_line(text.clone(), default());
+                                // B2：去掉 Markdown 标记（ratatui 不消费 ANSI）。
+                                self.push_line(
+                                    crate::markdown::strip_markdown(text),
+                                    default(),
+                                );
                             }
                             self.status = "就绪".to_string();
                         }
@@ -665,23 +840,38 @@ impl TuiApp {
             TurnEvent::TokenDelta { delta } => {
                 self.streaming.push_str(&delta);
             }
+            // 思考流：TUI 不逐字展示（Web 端有独立思考块），避免与正文交错。
+            TurnEvent::ReasoningDelta { .. } => {}
             TurnEvent::Compaction { summary } => {
                 self.flush_streaming();
                 self.push_system(format!("✦ 上下文已压缩：{summary}"), yellow());
             }
             TurnEvent::PermissionRequest(request) => {
                 self.flush_streaming();
-                self.pending_order.push(request.request_id.clone());
+                // FIFO 入队（多请求按到达顺序逐条处理）。
+                self.pending_order.push_back(request.request_id.clone());
+                let args_text = serde_json::to_string(&request.args).unwrap_or_default();
+                self.pending_info.push_back(PendingApprovalInfo {
+                    tool: request.tool.clone(),
+                    level: request.level.label().to_string(),
+                    reason: request.reason.clone(),
+                    args: if args_text.chars().count() > 400 {
+                        let head: String = args_text.chars().take(400).collect();
+                        format!("{head}…")
+                    } else {
+                        args_text
+                    },
+                });
                 self.push_line(
                     format!(
-                        "审批：需要 {} 权限执行 {}（{}）— 按 y 允许 / n 拒绝",
+                        "审批：需要 {} 权限执行 {}（{}）— y 一次 / a 本会话内 / s 总是 / n 拒绝",
                         request.level.label(),
                         request.tool,
                         request.reason
                     ),
                     yellow(),
                 );
-                self.status = "等待审批（y/n）".to_string();
+                self.status = "等待审批（y/a/s/n）".to_string();
             }
             TurnEvent::ToolStart { tool, .. } => {
                 self.flush_streaming();
@@ -700,6 +890,14 @@ impl TuiApp {
                     );
                 }
             }
+            TurnEvent::PlanUpdate { steps } => {
+                self.flush_streaming();
+                let done = steps
+                    .iter()
+                    .filter(|step| step.status == "completed")
+                    .count();
+                self.push_system(format!("≡ 计划更新：{done}/{} 步完成", steps.len()), blue());
+            }
             TurnEvent::Final { text } => {
                 if self.streaming.is_empty() {
                     self.push_line("── 结果 ──".to_string(), bold());
@@ -714,7 +912,8 @@ impl TuiApp {
     fn flush_streaming(&mut self) {
         if !self.streaming.is_empty() {
             let text = std::mem::take(&mut self.streaming);
-            self.push_line(text, default());
+            // B2：流式正文去 Markdown 标记后再入 transcript（保持可读）。
+            self.push_line(crate::markdown::strip_markdown(&text), default());
         }
     }
 
@@ -737,35 +936,31 @@ impl TuiApp {
         }
     }
 
-    fn respond_approval(&mut self, allow: bool) {
-        let Some(request_id) = self.pending_order.pop() else {
-            return;
-        };
-        let sent = self
-            .pending
-            .lock()
-            .ok()
-            .and_then(|mut map| map.remove(&request_id))
-            .map(|tx| {
-                tx.send(if allow {
-                    Decision::Allow
-                } else {
-                    Decision::Deny
-                })
-                .is_ok()
-            })
-            .unwrap_or(false);
-        if sent {
-            self.push_system(
-                if allow {
-                    "→ 已允许".to_string()
-                } else {
-                    "→ 已拒绝".to_string()
-                },
-                if allow { green() } else { red() },
-            );
+    fn respond_approval(&mut self, scope: ApprovalScope) {
+        // FIFO：处理队首请求；已超时/取消的条目跳过，继续处理下一个。
+        while let Some(request_id) = self.pending_order.pop_front() {
+            self.pending_info.pop_front();
+            let sent = self
+                .pending
+                .lock()
+                .ok()
+                .and_then(|mut map| map.remove(&request_id))
+                .map(|tx| tx.send(scope).is_ok())
+                .unwrap_or(false);
+            if !sent {
+                continue;
+            }
+            let (label, color) = match scope {
+                ApprovalScope::Once => ("→ 已允许（仅本次）", green()),
+                ApprovalScope::Session => ("→ 已允许（本会话内，规则已生效）", green()),
+                ApprovalScope::Always => ("→ 已允许（总是允许，已写入本机设置）", green()),
+                ApprovalScope::Deny => ("→ 已拒绝", red()),
+            };
+            self.push_system(label.to_string(), color);
             self.status = "执行中…".to_string();
+            return;
         }
+        self.status = "执行中…".to_string();
     }
 
     fn toggle_mode(&mut self) -> Result<(), Box<dyn std::error::Error>> {
@@ -791,6 +986,7 @@ impl TuiApp {
             &self.mcp_clients,
             &self.skills,
             &self.settings.deny_commands,
+            &self.settings.permissions.rules,
         )?);
         Ok(())
     }
@@ -994,9 +1190,8 @@ impl TuiApp {
             return Ok(());
         };
         let keep: usize = keep.parse().map_err(|_| "保留消息数需为数字".to_string())?;
-        if keep < session.messages.len() {
-            runtime.block_on(session.revert())?;
-        }
+        // 只回滚被截断段落的文件改动（更早回合的快照保留给 /diff 与 /revert）。
+        runtime.block_on(session.revert_from(keep))?;
         let removed = session.rewind(keep);
         self.store.save(session)?;
         self.push_system(
@@ -1493,7 +1688,8 @@ fn parse_keybind(spec: &str) -> Option<KeyEvent> {
 
 fn build_keybinds(configured: &HashMap<String, String>) -> HashMap<String, KeyEvent> {
     let defaults = [
-        ("toggle_mode", "tab"),
+        // B3：Tab 让给「补全」，模式切换改 F2（可在 settings.keybinds 覆盖）。
+        ("toggle_mode", "f2"),
         ("abort", "ctrl+c"),
         ("scroll_up", "pageup"),
         ("scroll_down", "pagedown"),
@@ -1546,6 +1742,29 @@ fn format_key(event: &KeyEvent) -> String {
 
 fn default() -> Style {
     Style::default()
+}
+/// 居中矩形（百分比宽高）：审批弹窗定位。
+fn centered_rect(
+    area: ratatui::layout::Rect,
+    percent_x: u16,
+    percent_y: u16,
+) -> ratatui::layout::Rect {
+    let vertical = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage((100 - percent_y) / 2),
+            Constraint::Percentage(percent_y),
+            Constraint::Percentage((100 - percent_y) / 2),
+        ])
+        .split(area);
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage((100 - percent_x) / 2),
+            Constraint::Percentage(percent_x),
+            Constraint::Percentage((100 - percent_x) / 2),
+        ])
+        .split(vertical[1])[1]
 }
 fn dim() -> Style {
     Style::default().fg(Color::DarkGray)
@@ -1615,12 +1834,47 @@ mod tests {
             .lock()
             .unwrap()
             .insert(request.request_id.clone(), tx);
-        app.pending_order.push(request.request_id.clone());
+        app.pending_order.push_back(request.request_id.clone());
+        app.pending_info.push_back(PendingApprovalInfo {
+            tool: request.tool.clone(),
+            level: request.level.label().to_string(),
+            reason: request.reason.clone(),
+            args: "{}".to_string(),
+        });
 
-        app.respond_approval(true);
+        app.respond_approval(ApprovalScope::Always);
 
-        assert_eq!(rx.try_recv().unwrap(), Decision::Allow);
+        // 通道承载档位（由 Approver 侧统一映射为决策并写规则）。
+        assert_eq!(rx.try_recv().unwrap(), ApprovalScope::Always);
         assert!(app.pending_order.is_empty());
+        assert!(app.pending_info.is_empty());
+    }
+
+    #[test]
+    fn approvals_are_answered_in_arrival_order() {
+        // A6-1：多请求 FIFO——此前用 pop() 会先回答最后一条。
+        let mut app = test_app();
+        let mut receivers = Vec::new();
+        for id in ["req-1", "req-2"] {
+            let (tx, rx) = mpsc::channel();
+            receivers.push(rx); // 持有接收端，否则 send 失败会被当成「已失效」跳过
+            app.pending.lock().unwrap().insert(id.to_string(), tx);
+            app.pending_order.push_back(id.to_string());
+            app.pending_info.push_back(PendingApprovalInfo {
+                tool: "write_file".to_string(),
+                level: "Write".to_string(),
+                reason: String::new(),
+                args: "{}".to_string(),
+            });
+        }
+        let first = app.pending_order.front().cloned().unwrap();
+        app.respond_approval(ApprovalScope::Once);
+        assert_eq!(first, "req-1", "应处理队首（到达顺序）");
+        assert_eq!(receivers[0].try_recv().unwrap(), ApprovalScope::Once);
+        assert_eq!(app.pending_order.front().cloned().unwrap(), "req-2");
+        let pending = app.pending.lock().unwrap();
+        assert!(!pending.contains_key("req-1"), "已响应的请求应出队");
+        assert!(pending.contains_key("req-2"), "未响应的请求仍在队列");
     }
 
     #[test]
@@ -1666,6 +1920,7 @@ mod tests {
             key,
             owo_agent_core::session::SnapshotEntry {
                 original_b64: Some("YmVmb3Jl".to_string()),
+                turn: 0,
             },
         );
         app.session = Some(session);

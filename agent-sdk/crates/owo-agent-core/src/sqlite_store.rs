@@ -231,6 +231,21 @@ impl SqliteSessionStore {
         self.status.read_only
     }
 
+    /// 删除会话记录（审计留痕不级联删除）。返回是否存在并被删除。
+    pub fn delete_session(&self, id: &str) -> Result<bool, AgentError> {
+        if self.is_read_only() {
+            return Err(AgentError::Session("存储处于只读降级，拒绝删除会话".into()));
+        }
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| AgentError::Session("SQLite 锁中毒".into()))?;
+        let affected = conn
+            .execute("DELETE FROM sessions WHERE id = ?1", params![id])
+            .map_err(sqlite_error)?;
+        Ok(affected > 0)
+    }
+
     /// 清空会话与审计，返回 (会话数, 审计数)。
     pub fn clear_all(&self) -> Result<(usize, usize), AgentError> {
         let conn = self
@@ -367,6 +382,8 @@ impl SqliteSessionStore {
             title: row.12,
             archived: row.13,
             pinned: row.14,
+            // 计划是会话内存态（不落库）；重启后由模型按需重建。
+            plan: None,
         })
     }
 }
@@ -374,6 +391,10 @@ impl SqliteSessionStore {
 impl SessionStore for SqliteSessionStore {
     fn clear(&self) -> Result<(), AgentError> {
         self.clear_all().map(|_| ())
+    }
+
+    fn delete(&self, id: &str) -> Result<bool, AgentError> {
+        self.delete_session(id)
     }
 
     fn is_read_only(&self) -> bool {

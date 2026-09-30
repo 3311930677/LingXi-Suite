@@ -13,7 +13,7 @@ window.OwoPanels.observability = (function () {
   var id = "observability";
 
   function defaultHelpers() {
-    var baseUrl = (window.OwoPanels && window.OwoPanels.baseUrl) || "http://127.0.0.1:4098";
+    var baseUrl = (window.OwoPanels && window.OwoPanels.baseUrl) || window.location.origin;
     function get(path) {
       return fetch(baseUrl + path).then(function (r) {
         if (!r.ok) throw new Error("HTTP " + r.status);
@@ -40,13 +40,20 @@ window.OwoPanels.observability = (function () {
     return (
       '<section data-panel="' + id + '">' +
       '<style>' +
-      '.owo-mtr-row{display:flex;gap:8px;align-items:center;padding:4px 0;border-bottom:1px solid #eee}' +
-      '.owo-mtr-card{display:inline-block;min-width:88px;padding:6px 10px;margin:2px;background:#f4f6f8;border-radius:6px;text-align:center}' +
-      '.owo-mtr-card b{display:block;font-size:16px}' +
-      '.owo-mtr-card span{font-size:11px;color:#666}' +
+      '.owo-mtr-row{display:flex;gap:8px;align-items:center;padding:4px 0;border-bottom:1px solid var(--border)}' +
+      // KPI 卡片：自适应网格（此前 8 张 inline-block 挤成一行，数字与标签贴在一起）
+      '#owo-mtr-cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(116px,1fr));gap:8px}' +
+      '.owo-mtr-card{display:flex;flex-direction:column;gap:2px;justify-content:center;padding:9px 12px;background:var(--surface-2);border:1px solid var(--border);border-radius:var(--r-md);text-align:left}' +
+      '.owo-mtr-card b{font-size:19px;font-variant-numeric:tabular-nums;line-height:1.1;color:var(--text);overflow-wrap:anywhere}' +
+      '.owo-mtr-card span{font-size:11px;color:var(--text-2)}' +
       '.owo-mtr-table{width:100%;border-collapse:collapse;font-size:12px}' +
-      '.owo-mtr-table td,.owo-mtr-table th{border:1px solid #ddd;padding:3px 6px;text-align:left}' +
-      '.owo-mtr-health b.ok{color:#2e7d32}.owo-mtr-health b.bad{color:#c62828}' +
+      '.owo-mtr-table td,.owo-mtr-table th{border:0;border-bottom:1px solid var(--border);padding:5px 9px;text-align:left}' +
+      '.owo-mtr-table th{background:var(--surface-2);color:var(--text-2);font-weight:650;white-space:nowrap}' +
+      '.owo-mtr-table tbody tr:nth-child(even){background:var(--surface-2)}' +
+      '.owo-mtr-table tbody tr:hover{background:var(--accent-soft)}' +
+      '.owo-mtr-table tbody tr:last-child td{border-bottom:0}' +
+      '.owo-mtr-table td:first-child{width:38%;color:var(--text-2)}' +
+      '.owo-mtr-health b.ok{color:var(--green)}.owo-mtr-health b.bad{color:var(--red)}' +
       '</style>' +
       '<div class="stack">' +
       '<div class="sub">可观测性 / 性能护栏</div>' +
@@ -93,7 +100,7 @@ window.OwoPanels.observability = (function () {
       })
       .catch(function (e) {
         var el = document.getElementById("owo-mtr-cards");
-        if (el) el.innerHTML = '<span style="color:#c62828">' + H.esc(H.friendlyError(e)) + "</span>";
+        if (el) el.innerHTML = '<span style="color:var(--red)">' + H.esc(H.friendlyError(e)) + "</span>";
       });
     H.get("/metrics/turns?limit=50")
       .then(function (data) {
@@ -153,7 +160,7 @@ window.OwoPanels.observability = (function () {
       })
       .catch(function (e) {
         var el = document.getElementById("owo-mtr-report");
-        if (el) el.innerHTML = '<span style="color:#c62828">' + H.esc(H.friendlyError(e)) + "</span>";
+        if (el) el.innerHTML = '<span style="color:var(--red)">' + H.esc(H.friendlyError(e)) + "</span>";
       });
   }
 
@@ -199,8 +206,8 @@ window.OwoPanels.observability = (function () {
       .join(" ");
     el.innerHTML =
       '<svg width="100%" viewBox="0 0 ' + width + " " + height + '" style="max-width:560px">' +
-      '<polyline points="' + points + '" fill="none" stroke="#2e7d32" stroke-width="1.5"></polyline>' +
-      "<text x=\"4\" y=\"14\" font-size=\"10\" fill=\"#666\">峰值 " + max + " ms（最近 " + values.length + " 次）</text>" +
+      '<polyline points="' + points + '" fill="none" style="stroke:var(--green)" stroke-width="1.5"></polyline>' +
+      "<text x=\"4\" y=\"14\" font-size=\"10\" style=\"fill:var(--text-3)\">峰值 " + max + " ms（最近 " + values.length + " 次）</text>" +
       "</svg>";
   }
 
@@ -275,9 +282,12 @@ window.OwoPanels.observability = (function () {
         var target = item.target_ms == null ? (item.success_floor == null ? "—" : (item.success_floor * 100).toFixed(1) + "%") : item.target_ms + " ms";
         var p95 = item.p95_ms == null ? "—" : item.p95_ms + " ms";
         var rate = item.success_rate == null ? "—" : (item.success_rate * 100).toFixed(2) + "%";
-        var status = item.achieving
-          ? '<b class="ok" style="color:#2e7d32">达标</b>'
-          : '<b style="color:#c62828">未达标</b>';
+        // 样本为 0 时不能报"达标"：没有观测数据就无达标可言，显示灰色"样本不足"避免误判。
+        var status = (item.samples || 0) === 0
+          ? '<b style="color:var(--text-3)">样本不足</b>'
+          : item.achieving
+            ? '<b class="ok">达标</b>'
+            : '<b class="bad">未达标</b>';
         return (
           "<tr><td>" + H.esc(item.name) + "</td><td>" + H.esc(target) +
           "</td><td>" + p95 + "</td><td>" + rate +
@@ -305,7 +315,7 @@ window.OwoPanels.observability = (function () {
     var rows = dims
       .map(function (d) {
         var budget = d.budget ? "，预算 " + H.esc(String(d.budget.limit_usd)) + " USD" : "";
-        var exceeded = d.budget && d.budget.exceeded ? ' <b style="color:#c62828">超限</b>' : "";
+        var exceeded = d.budget && d.budget.exceeded ? ' <b class="bad">超限</b>' : "";
         return (
           "<tr><td>" + H.esc(d.dimension) + "</td><td>" + (d.calls || 0) +
           "</td><td>" + (d.total_tokens || 0) +
@@ -316,7 +326,7 @@ window.OwoPanels.observability = (function () {
       })
       .join("");
     var stop = u.hard_stop
-      ? ' <b style="color:#c62828">硬熔断中</b>' + (u.hard_stop_reason ? "（" + H.esc(u.hard_stop_reason) + "）" : "")
+      ? ' <b class="bad">硬熔断中</b>' + (u.hard_stop_reason ? "（" + H.esc(u.hard_stop_reason) + "）" : "")
       : "";
     el.innerHTML =
       "<div class=\"owo-mtr-row\">记录 " + (u.count || 0) + " 条，单价 " + H.esc(String(u.price_per_mtok)) + " $/Mtok" + stop + "</div>" +
@@ -345,7 +355,7 @@ window.OwoPanels.observability = (function () {
     var alerts = (data.alerts || []).slice(0, 8);
     var alertHtml = alerts
       .map(function (a) {
-        var color = a.kind === "recovered" ? "#2e7d32" : a.severity === "critical" ? "#c62828" : "#ef6c00";
+        var color = a.kind === "recovered" ? "var(--green)" : a.severity === "critical" ? "var(--red)" : "var(--yellow)";
         return "<div class=\"owo-mtr-row\"><span style=\"color:" + color + "\">[" + H.esc(a.kind) +
           "] " + H.esc(a.rule) + "</span><span class=\"sub\">" +
           H.esc(String(a.at || "").slice(11, 19)) + "</span></div><div class=\"sub\">" +
@@ -375,9 +385,12 @@ window.OwoPanels.observability = (function () {
       .map(function (item) {
         var p95 = item.p95_ms == null ? "—" : item.p95_ms + " ms";
         var rate = item.success_rate == null ? "—" : (item.success_rate * 100).toFixed(2) + "%";
-        var status = item.achieving
-          ? '<b style="color:#2e7d32">达标</b>'
-          : '<b style="color:#c62828">未达标</b>';
+        // 样本为 0 时不能报"达标"：没有观测数据就无达标可言，显示灰色"样本不足"避免误判。
+        var status = (item.samples || 0) === 0
+          ? '<b style="color:var(--text-3)">样本不足</b>'
+          : item.achieving
+            ? '<b class="ok">达标</b>'
+            : '<b class="bad">未达标</b>';
         return (
           "<tr><td>" + H.esc(item.name) + "</td><td>" + p95 +
           "</td><td>" + rate + "</td><td>" + (item.samples || 0) +
@@ -405,8 +418,8 @@ window.OwoPanels.observability = (function () {
     }
     var enabled = !!t.enabled;
     var status = enabled
-      ? '<b style="color:#ef6c00">开（仅聚合指标，不含内容）</b>'
-      : '<b class="ok" style="color:#2e7d32">关（默认）</b>';
+      ? '<b style="color:var(--yellow)">开（仅聚合指标，不含内容）</b>'
+      : '<b class="ok">关（默认）</b>';
     var counters = t.counters || {};
     var codes = t.error_codes || {};
     var perf = t.performance || {};

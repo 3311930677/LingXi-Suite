@@ -15,11 +15,14 @@ impl ModelProvider for KeywordProvider {
         messages: &[ChatMessage],
         _tools: &[ToolSpec],
     ) -> Result<ModelOutput, String> {
+        // 意图关键词应取自最后一条用户消息：系统提示词里同样会出现
+        // "读取/创建/列出" 等词，混入全量 messages 会污染分支判断。
         let text = messages
             .iter()
+            .filter(|message| message.role == "user")
             .filter_map(|message| message.content.clone())
-            .collect::<Vec<_>>()
-            .join("\n");
+            .next_back()
+            .unwrap_or_default();
         let output = if text.contains("读取") {
             "内容：hello-eval".to_string()
         } else if text.contains("创建") {

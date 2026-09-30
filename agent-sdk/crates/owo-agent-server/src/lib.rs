@@ -58,7 +58,9 @@ use axum::response::sse::{Event, Sse};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use owo_agent_core::automation::{AutomationAction, AutomationStore, AutomationTask, Schedule};
+use owo_agent_core::automation::{
+    AutomationAction, AutomationRun, AutomationStore, AutomationTask, Schedule,
+};
 use owo_agent_core::learn::{
     ActionType, LearnPipeline, LearnState, ProactiveEngine, ProactiveSuggestion, RecordedAction,
     SemanticAnchor, Sensitivity, SuggestionAction,
@@ -66,6 +68,7 @@ use owo_agent_core::learn::{
 use owo_agent_core::locate::{locate, AnchorQuery};
 use owo_agent_core::perception::{SituationSnapshot, SituationStore};
 use owo_agent_core::permissions::{Approver, Decision, PermissionRequest};
+use owo_agent_core::question::{QuestionAnswer, Questioner, UserQuestion};
 use owo_agent_core::scene::{Evidence, EvidenceSource, GraphElement};
 use owo_agent_core::session::{Session, SessionStore};
 use owo_agent_core::validate_skill_package;
@@ -94,6 +97,13 @@ pub struct AppState {
     pub sessions: Arc<Mutex<HashMap<String, Session>>>,
     pub pending_approvals: Arc<Mutex<HashMap<String, tokio::sync::oneshot::Sender<Decision>>>>,
     pub pending_approval_sessions: Arc<Mutex<HashMap<String, String>>>,
+    /// 待审批请求原文（`request_id → (tool, args)`）：`remember=true` 生成权限规则所需。
+    pub pending_approval_details: Arc<Mutex<HashMap<String, (String, Value)>>>,
+    /// 等待用户回答的提问（ask_user 工具）：question_id → 一次性应答通道。
+    pub pending_questions:
+        Arc<Mutex<HashMap<String, tokio::sync::oneshot::Sender<QuestionAnswer>>>>,
+    /// 提问归属会话（应答路由校验用）。
+    pub pending_question_sessions: Arc<Mutex<HashMap<String, String>>>,
     pub aborts: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
     /// 每个会话一个运行锁，避免并发回合覆盖消息、快照和审计状态。
     pub turn_locks: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
@@ -124,6 +134,25 @@ pub struct AppState {
     pub rate_limiter: Arc<rate_limit::RateLimiter>,
     /// R8 服务端韧性：全局并发 turn 上限 + 优雅关闭信号（CLI serve 接线退出）。
     pub shutdown_gate: Arc<shutdown::ShutdownGate>,
+    /// A8-2：活跃回合快照（`/activity`）——session_id → {phase, tool, started_at…}。
+    /// 由 turn handler 的事件回调维护，回合结束移除；供桌宠等外部进度面板轮询。
+    pub activities: Arc<Mutex<HashMap<String, Value>>>,
+    /// A8-3：桌面挂件（桌宠）显隐中转——工作台（浏览器）写期望值，桌面端
+    /// （overlay）轮询上报实际值并应用差异。
+    pub pet_state: Arc<Mutex<PetState>>,
+}
+
+/// A8-3：桌宠显隐的期望/实际状态。
+#[derive(Debug, Default)]
+pub struct PetState {
+    /// 工作台开关写入的期望值。
+    pub desired: Option<bool>,
+    pub desired_at: Option<String>,
+    /// 桌面端心跳上报的实际值。
+    pub actual: Option<bool>,
+    pub actual_at: Option<String>,
+    /// 最近一次心跳时刻（判断桌面端是否在线）。
+    pub actual_seen: Option<std::time::Instant>,
 }
 
 impl AppState {
@@ -134,8 +163,13 @@ impl AppState {
         data_root: PathBuf,
         workspace: PathBuf,
     ) -> Self {
-        let settings = owo_agent_core::Settings::load(&workspace);
+        let settings = owo_agent_core::Settings::load_encrypted(&workspace)
+            .unwrap_or_else(|_| owo_agent_core::Settings::load(&workspace));
         settings.apply_usage_env();
+        // 推理档位同样落环境变量：provider 每次请求前读取，设置页保存即时生效。
+        settings.apply_reasoning_env();
+        // 已保存的模型接入（端点/密钥/模型）优先于启动终端的环境变量。
+        settings.apply_provider_override();
         // R8：用量预算接线（Agent 4 交付 usage）——单价/预算从环境变量注入，turn 入口硬熔断。
         {
             let usage_store = usage::global();
@@ -174,6 +208,9 @@ impl AppState {
             sessions: Arc::new(Mutex::new(HashMap::new())),
             pending_approvals: Arc::new(Mutex::new(HashMap::new())),
             pending_approval_sessions: Arc::new(Mutex::new(HashMap::new())),
+            pending_approval_details: Arc::new(Mutex::new(HashMap::new())),
+            pending_questions: Arc::new(Mutex::new(HashMap::new())),
+            pending_question_sessions: Arc::new(Mutex::new(HashMap::new())),
             aborts: Arc::new(Mutex::new(HashMap::new())),
             turn_locks: Arc::new(Mutex::new(HashMap::new())),
             traces_dir,
@@ -188,6 +225,8 @@ impl AppState {
                 &data_root,
             ))),
             automations: Arc::new(Mutex::new(AutomationStore::new(data_root.clone()))),
+            activities: Arc::new(Mutex::new(HashMap::new())),
+            pet_state: Arc::new(Mutex::new(PetState::default())),
             memory: Arc::new(Mutex::new(owo_agent_core::MemoryStore::new(
                 data_root.join("memory.jsonl"),
             ))),
@@ -240,7 +279,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/usage", get(usage_summary))
         .route("/audit", get(audit_list))
         .route("/session", post(create_session))
-        .route("/session/{id}", get(get_session))
+        .route("/session/{id}", get(get_session).delete(session_delete))
         .route("/session/{id}/turn", post(turn))
         .route("/session/{id}/attachments", get(attachments_list))
         .route("/session/{id}/attachments", post(attachment_upload))
@@ -248,6 +287,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             "/session/{id}/permission/{request_id}",
             post(respond_permission),
         )
+        .route("/permissions/rules", get(permission_rules_list))
+        .route("/permissions/rules/remove", post(remove_permission_rule))
+        .route("/approvals/pending", get(pending_approvals_list))
+        .route("/session/{id}/answer/{question_id}", post(respond_question))
         .route("/session/{id}/abort", post(abort_turn))
         .route("/session/{id}/diff", get(diff))
         .route("/session/{id}/revert", post(revert))
@@ -346,7 +389,11 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             "/automations/reminders/clear",
             post(automations_clear_reminders),
         )
+        // A8-1：执行记录（任务中心查询）。
+        .route("/automations/runs", get(automations_runs))
         .route("/settings", get(settings_get).post(settings_update))
+        .route("/fs/pick-directory", post(fs_pick_directory))
+        .route("/fs/open", post(fs_open))
         .route("/settings/egress", post(settings_egress))
         .route("/whitelist", get(whitelist_list))
         .route("/whitelist/manage", post(whitelist_manage))
@@ -390,6 +437,11 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         // R8 服务端韧性（并发上限/状态/优雅关闭）。
         .route("/server/status", get(server_status))
         .route("/server/shutdown", post(server_shutdown))
+        // A8-2：活跃回合快照（桌宠/外部进度面板轮询）。
+        .route("/activity", get(activity_list))
+        // A8-3：桌面挂件（桌宠）显隐通道——工作台开关 ↔ 桌面端。
+        .route("/desktop/pet", get(pet_state_get).post(pet_state_set))
+        .route("/desktop/pet/report", post(pet_state_report))
         // R8 用量预算：加额恢复（硬熔断后 request_topup 解除停轮）。
         .route("/usage/topup", post(usage_topup))
         // 与 R6 同款对齐：先 with_state 定 S，再 merge 模块 router（Router<()> 经 From 转换）。
@@ -441,6 +493,22 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .layer(axum::middleware::from_fn(deprecation_middleware))
         .fallback_service(ServeDir::new(desktop_web_dir()))
         .layer(cors_layer())
+        // 本地工具：API 与静态资源一律禁用浏览器缓存——工作台由磁盘直读，
+        // 启发式缓存会让「代码改了页面却没变」（已实测 app.js 被缓存拿旧逻辑）。
+        .layer(axum::middleware::from_fn(no_store_middleware))
+}
+
+/// 全局 `Cache-Control: no-store`（含静态资源；SSE 不受影响）。
+async fn no_store_middleware(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let mut response = next.run(request).await;
+    response.headers_mut().insert(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-store, no-cache, must-revalidate"),
+    );
+    response
 }
 
 /// R8/R9：trace_id 请求贯穿——从 `X-Trace-Id` 头继承（不合法则生成），回填响应头，
@@ -545,7 +613,7 @@ async fn openapi_spec() -> Json<Value> {
                 "requestBody": { "content": { "application/json": { "schema": { "$ref": "#/components/schemas/CreateSessionRequest" } } } },
                 "responses": { "200": { "description": "session created", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/SessionInfo" } } } } }
             } },
-            "/session/{id}": { "get": { "operationId": "getSession", "parameters": [path_param("id")], "responses": { "200": { "description": "session detail with messages" } } } },
+            "/session/{id}": { "get": { "operationId": "getSession", "parameters": [path_param("id")], "responses": { "200": { "description": "session detail with messages" } } }, "delete": { "operationId": "sessionDelete", "parameters": [path_param("id")], "responses": { "200": { "description": "session deleted（审计留痕不级联）" } } } },
             "/session/{id}/turn": { "post": {
                 "operationId": "agentTurn",
                 "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
@@ -555,6 +623,7 @@ async fn openapi_spec() -> Json<Value> {
             "/session/{id}/attachments": { "get": { "operationId": "attachmentsList", "parameters": [path_param("id")], "responses": { "200": { "description": "attachment list" } } }, "post": { "operationId": "attachmentUpload", "parameters": [path_param("id")], "responses": { "200": { "description": "uploaded attachment" } } } },
             "/session/{id}/abort": { "post": { "operationId": "abortTurn", "parameters": [path_param("id")], "responses": { "200": { "description": "ok" } } } },
             "/session/{id}/permission/{request_id}": { "post": { "operationId": "respondPermission", "parameters": [path_param("id"), path_param("request_id")], "responses": { "200": { "description": "ok" } } } },
+            "/session/{id}/answer/{question_id}": { "post": { "operationId": "respondQuestion", "parameters": [path_param("id"), path_param("question_id")], "responses": { "200": { "description": "ok" } } } },
             "/session/{id}/diff": { "get": { "operationId": "sessionDiff", "parameters": [path_param("id")], "responses": { "200": { "description": "diff list" } } } },
             "/session/{id}/revert": { "post": { "operationId": "sessionRevert", "parameters": [path_param("id")], "responses": { "200": { "description": "ok" } } } },
             "/session/{id}/fork": { "post": { "operationId": "sessionFork", "parameters": [path_param("id")], "responses": { "200": { "description": "forked session" } } } },
@@ -601,8 +670,11 @@ async fn openapi_spec() -> Json<Value> {
             "/automations/{id}": { "delete": { "operationId": "automationsDelete", "parameters": [path_param("id")], "responses": { "200": { "description": "ok" } } } },
             "/automations/reminders": { "get": { "operationId": "automationsReminders", "responses": { "200": { "description": "pending reminders" } } } },
             "/automations/reminders/clear": { "post": { "operationId": "automationsClearReminders", "responses": { "200": { "description": "ok" } } } },
+            "/automations/runs": { "get": { "operationId": "automationsRuns", "responses": { "200": { "description": "recent automation run records (task_id/limit query)" } } } },
             "/settings": { "get": { "operationId": "settingsGet", "responses": { "200": { "description": "workspace settings" } } }, "post": { "operationId": "settingsUpdate", "responses": { "200": { "description": "workspace settings" } } } },
             "/settings/egress": { "post": { "operationId": "settingsEgress", "responses": { "200": { "description": "cloud enabled state" } } } },
+            "/fs/pick-directory": { "post": { "operationId": "fsPickDirectory", "requestBody": { "content": { "application/json": { "schema": { "type": "object" } } } }, "responses": { "200": { "description": "selected absolute directory path (null when cancelled)" } } } },
+            "/fs/open": { "post": { "operationId": "fsOpenPath", "requestBody": { "content": { "application/json": { "schema": { "type": "object" } } } }, "responses": { "200": { "description": "opened the workspace path with the requested opener (opener = program actually used)" } } } },
             "/whitelist": { "get": { "operationId": "whitelistList", "responses": { "200": { "description": "whitelist entries" } } } },
             "/session/{id}/context": { "get": { "operationId": "sessionContext", "parameters": [path_param("id")], "responses": { "200": { "description": "context stats: messages/tokens/budget/compaction/rules" } } } },
             "/skills/health": { "get": { "operationId": "skillsHealth", "responses": { "200": { "description": "flow skill health overview" } } } },
@@ -731,6 +803,9 @@ async fn openapi_spec() -> Json<Value> {
             "/storage/export": { "post": { "operationId": "storageExport", "responses": { "200": { "description": "full standard JSON export" } } } },
             "/storage/clear": { "post": { "operationId": "storageClear", "requestBody": { "content": { "application/json": { "schema": { "type": "object", "properties": { "confirm": { "type": "string", "enum": ["CLEAR_ALL"] } } } } } }, "responses": { "200": { "description": "cleared with integrity check" } } } },
             "/server/status": { "get": { "operationId": "serverStatus", "responses": { "200": { "description": "concurrency gate + storage migration status" } } } },
+            "/activity": { "get": { "operationId": "activityList", "responses": { "200": { "description": "active turns snapshot (session/phase/tool) + pending approval count" } } } },
+            "/desktop/pet": { "get": { "operationId": "petStateGet", "responses": { "200": { "description": "desktop pet visibility (desired from workbench, actual from overlay heartbeat, overlay_online)" } } }, "post": { "operationId": "petStateSet", "requestBody": { "content": { "application/json": { "schema": { "type": "object", "properties": { "visible": { "type": "boolean" } }, "required": ["visible"] } } } }, "responses": { "200": { "description": "desired pet visibility updated" } } } },
+            "/desktop/pet/report": { "post": { "operationId": "petStateReport", "requestBody": { "content": { "application/json": { "schema": { "type": "object", "properties": { "visible": { "type": "boolean" } }, "required": ["visible"] } } } }, "responses": { "200": { "description": "overlay heartbeat accepted; returns desired visibility" } } } },
             "/server/shutdown": { "post": { "operationId": "serverShutdown", "requestBody": { "content": { "application/json": { "schema": { "type": "object", "properties": { "confirm": { "type": "boolean" } }, "required": ["confirm"] } } } }, "responses": { "200": { "description": "graceful shutdown requested" } } } },
             "/usage/summary": { "get": { "operationId": "usageSummaryV2", "responses": { "200": { "description": "four-dimension usage aggregation + budget hard-stop state" } } } },
             "/usage/records": { "get": { "operationId": "usageRecords", "parameters": [{ "name": "dimension", "in": "query", "required": false, "schema": { "type": "string", "enum": ["session", "workflow_run", "goal_step", "tool"] } }, { "name": "limit", "in": "query", "required": false, "schema": { "type": "integer" } }], "responses": { "200": { "description": "usage records filtered by dimension" } } } },
@@ -870,6 +945,11 @@ async fn usage_summary(State(state): State<Arc<AppState>>) -> Json<Value> {
     Json(json!({
         "usage": usage,
         "cost_usd": cost,
+        // P1-1：token 计数口径（排查估算偏差用；cl100k 对非 OpenAI 模型为近似）。
+        "tokenizer": {
+            "name": owo_agent_core::tokenizer_name(),
+            "estimated": true,
+        },
         "budget": {
             "token_cap": token_cap,
             "cost_cap_usd": cost_cap,
@@ -1175,6 +1255,230 @@ async fn skill_enabled(
     })))
 }
 
+#[derive(serde::Deserialize)]
+struct PickDirectoryRequest {
+    /// 打开对话框时的起始目录（当前工作区），可为空。
+    #[serde(default)]
+    initial: Option<String>,
+    /// 等待用户选择的秒数上限（默认 180，夹取 5..=600）。
+    #[serde(default)]
+    timeout_secs: Option<u64>,
+}
+
+/// 调起系统原生「选择文件夹」对话框，返回绝对路径（取消时 path 为 null）。
+/// 浏览器拿不到本地绝对路径，这里由同机的本机服务代劳。
+async fn fs_pick_directory(
+    Json(request): Json<PickDirectoryRequest>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    #[cfg(windows)]
+    {
+        let initial = request.initial.unwrap_or_default();
+        let timeout =
+            std::time::Duration::from_secs(request.timeout_secs.unwrap_or(180).clamp(5, 600));
+        let selected =
+            tokio::task::spawn_blocking(move || pick_directory_windows(&initial, timeout))
+                .await
+                .map_err(|e| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("选择窗口异常：{e}"),
+                    )
+                })?
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+        Ok(Json(json!({ "path": selected })))
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = request;
+        Err((
+            StatusCode::NOT_IMPLEMENTED,
+            "系统文件夹对话框仅支持 Windows，请手动填写绝对路径".to_string(),
+        ))
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct OpenPathRequest {
+    /// 工作区内的相对路径或绝对路径。
+    path: String,
+    /// 可选行号：仅对支持定位的编辑器生效（VS Code `-g`）。
+    #[serde(default)]
+    line: Option<u32>,
+    /// 打开方式：system / notepad / vscode（未知取值回落 system）。
+    #[serde(default)]
+    opener: Option<String>,
+}
+
+/// 在工作区内打开文件（工具步骤 chip 与回合汇报卡里点击路径的动作）。
+///
+/// 安全边界（这是「本机服务代浏览器打开文件」的放行理由）：
+/// 1. 路径必须落在当前工作区内（复用 `resolve_within`，越界一律 403）；
+/// 2. 打开方式走白名单，不接受任意命令——只把用户点击的那个路径交给选定程序，
+///    绝不执行模型产出的字符串；
+/// 3. 端点位于鉴权保护面（bearer token），非本机配对客户端拿不到。
+async fn fs_open(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<OpenPathRequest>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let raw = request.path.trim();
+    if raw.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "path 不能为空".to_string()));
+    }
+    let resolved = owo_agent_core::permissions::resolve_within(&state.workspace, raw)
+        .map_err(|error| (StatusCode::FORBIDDEN, error))?;
+    let path = resolved
+        .canonicalize()
+        .map_err(|error| (StatusCode::NOT_FOUND, format!("路径不可访问：{error}")))?;
+    let opener = normalize_opener(request.opener.as_deref());
+    let line = request.line.filter(|value| *value > 0);
+    let opened = tokio::task::spawn_blocking(move || launch_opener(&path, line, &opener)).await;
+    let used = opened
+        .map_err(|error| internal_error(format!("打开文件异常：{error}")))?
+        .map_err(internal_error)?;
+    Ok(Json(json!({ "ok": true, "opener": used })))
+}
+
+/// 内部错误统一映射为 500（文本原样透出，前端 toast 直接可读）。
+fn internal_error(message: String) -> (StatusCode, String) {
+    (StatusCode::INTERNAL_SERVER_ERROR, message)
+}
+
+/// 打开方式白名单归一化：未知取值一律回落系统默认。
+fn normalize_opener(raw: Option<&str>) -> String {
+    match raw.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
+        Some("notepad") => "notepad".to_string(),
+        Some("vscode") => "vscode".to_string(),
+        _ => "system".to_string(),
+    }
+}
+
+/// 启动外部程序打开路径，返回**实际生效**的打开方式（回落时如实返回 system，不假装成功）。
+/// 子进程直接 detach：编辑器/查看器要一直开着，服务端不等待也不回收。
+fn launch_opener(
+    path: &std::path::Path,
+    line: Option<u32>,
+    opener: &str,
+) -> Result<String, String> {
+    let launched = match opener {
+        "vscode" => {
+            let target = format!("{}:{}", path.display(), line.unwrap_or(1));
+            std::process::Command::new("code")
+                .arg("-g")
+                .arg(&target)
+                .spawn()
+                .is_ok()
+        }
+        "notepad" => std::process::Command::new("notepad")
+            .arg(path)
+            .spawn()
+            .is_ok(),
+        _ => false,
+    };
+    if launched {
+        return Ok(opener.to_string());
+    }
+    launch_system_default(path)?;
+    Ok("system".to_string())
+}
+
+/// 系统默认程序打开。Windows 走 explorer：不经 cmd，路径里的 `& | ^ >` 不会被当成
+/// shell 元字符（否则一个名为 `a&calc.txt` 的文件就能变成命令注入）。
+#[cfg(windows)]
+fn launch_system_default(path: &std::path::Path) -> Result<(), String> {
+    std::process::Command::new("explorer")
+        .arg(path)
+        .spawn()
+        .map(|_| ())
+        .map_err(|error| format!("启动系统默认程序失败：{error}"))
+}
+
+#[cfg(target_os = "macos")]
+fn launch_system_default(path: &std::path::Path) -> Result<(), String> {
+    std::process::Command::new("open")
+        .arg(path)
+        .spawn()
+        .map(|_| ())
+        .map_err(|error| format!("启动系统默认程序失败：{error}"))
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn launch_system_default(path: &std::path::Path) -> Result<(), String> {
+    std::process::Command::new("xdg-open")
+        .arg(path)
+        .spawn()
+        .map(|_| ())
+        .map_err(|error| format!("启动系统默认程序失败：{error}"))
+}
+
+/// 用 Windows PowerShell 调起原生文件夹选择框（STA + TopMost 隐形宿主，
+/// 避免对话框被浏览器挡住）；超时后杀掉子进程。
+#[cfg(windows)]
+fn pick_directory_windows(
+    initial: &str,
+    timeout: std::time::Duration,
+) -> Result<Option<String>, String> {
+    use std::os::windows::process::CommandExt;
+    use std::process::{Command, Stdio};
+    // 不弹出 PowerShell 控制台窗口
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let script = r#"
+Add-Type -AssemblyName System.Windows.Forms | Out-Null
+Add-Type -AssemblyName System.Drawing | Out-Null
+$owner = New-Object System.Windows.Forms.Form
+$owner.TopMost = $true
+$owner.ShowInTaskbar = $false
+$owner.FormBorderStyle = 'None'
+$owner.StartPosition = 'Manual'
+$owner.Location = New-Object System.Drawing.Point(-2000, -2000)
+$owner.Size = New-Object System.Drawing.Size(1, 1)
+$owner.Show()
+$dialog = New-Object System.Windows.Forms.FolderBrowserDialog
+$dialog.Description = '选择 OwO Agent 工作区文件夹'
+$dialog.ShowNewFolderButton = $true
+$initial = $env:OWO_PICK_INITIAL
+if ($initial -and (Test-Path -LiteralPath $initial -PathType Container)) { $dialog.SelectedPath = $initial }
+if ($dialog.ShowDialog($owner) -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($dialog.SelectedPath) }
+"#;
+    let mut child = Command::new("powershell")
+        .args(["-NoProfile", "-STA", "-Command", script])
+        .env("OWO_PICK_INITIAL", initial)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .creation_flags(CREATE_NO_WINDOW)
+        .spawn()
+        .map_err(|e| format!("无法启动系统选择窗口（powershell）：{e}"))?;
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err("等待系统选择窗口超时（可能服务不在你的桌面会话中）".to_string());
+                }
+                std::thread::sleep(std::time::Duration::from_millis(150));
+            }
+            Err(e) => return Err(format!("系统选择窗口状态异常：{e}")),
+        }
+    }
+    let output = child
+        .wait_with_output()
+        .map_err(|e| format!("读取选择结果失败：{e}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("系统选择窗口失败：{}", stderr.trim()));
+    }
+    let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if path.is_empty() {
+        return Ok(None); // 用户取消选择
+    }
+    if !std::path::Path::new(&path).is_dir() {
+        return Err(format!("所选路径不是文件夹：{path}"));
+    }
+    Ok(Some(path))
+}
+
 async fn create_session(
     State(state): State<Arc<AppState>>,
     Json(request): Json<CreateSessionRequest>,
@@ -1187,7 +1491,8 @@ async fn create_session(
         ));
     }
     let model = request.model.unwrap_or_else(|| {
-        std::env::var("OPENAI_MODEL").unwrap_or_else(|_| "deepseek-v4-flash".to_string())
+        std::env::var("OPENAI_MODEL")
+            .unwrap_or_else(|_| owo_agent_core::gateway::DEFAULT_MODEL.to_string())
     });
     let session = state
         .store
@@ -1240,6 +1545,8 @@ async fn turn(
 ) -> Result<Sse<UnboundedReceiverStream<Result<Event, Infallible>>>, (StatusCode, String)> {
     let session = load_session(&state, &id)?;
     let mut effective_prompt = request.prompt.clone();
+    let mut attachment_images: Vec<owo_agent_core::MessageImage> = Vec::new();
+    use base64::Engine as _;
     if !request.attachments.is_empty() {
         let dir = attachment_dir(&session.workspace, &id);
         let mut lines = Vec::new();
@@ -1253,6 +1560,46 @@ async fn turn(
                 return Err((StatusCode::BAD_REQUEST, format!("附件不存在：{safe}")));
             }
             let size = std::fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
+            // A1-2 多模态：图片附件 → base64 data URL 进 images（真正进视觉上下文），
+            // 不再只注入路径文本；文本类附件维持路径注入。
+            let is_image = path
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .map(|ext| {
+                    matches!(
+                        ext.to_ascii_lowercase().as_str(),
+                        "png" | "jpg" | "jpeg" | "webp" | "gif"
+                    )
+                })
+                .unwrap_or(false);
+            if is_image {
+                const MAX_IMAGE_BYTES: u64 = 5 * 1024 * 1024;
+                if size > MAX_IMAGE_BYTES {
+                    return Err((
+                        StatusCode::BAD_REQUEST,
+                        format!("图片附件过大（{size} 字节 > 5MB）：{safe}"),
+                    ));
+                }
+                let bytes = std::fs::read(&path)
+                    .map_err(|e| (StatusCode::BAD_REQUEST, format!("附件读取失败：{e}")))?;
+                let media_type = path
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    .map(|ext| ext.to_ascii_lowercase())
+                    .map(|lower| match lower.as_str() {
+                        "jpg" => "jpeg".to_string(),
+                        other => other.to_string(),
+                    })
+                    .unwrap_or_else(|| "png".to_string());
+                attachment_images.push(owo_agent_core::MessageImage {
+                    url: format!(
+                        "data:image/{media_type};base64,{}",
+                        base64::engine::general_purpose::STANDARD.encode(bytes)
+                    ),
+                });
+                lines.push(format!("- {}（图片，{} 字节，已附到消息）", safe, size));
+                continue;
+            }
             lines.push(format!(
                 "- {}（{} 字节，路径 {}）",
                 safe,
@@ -1260,8 +1607,10 @@ async fn turn(
                 path.display()
             ));
         }
-        effective_prompt.push_str("\n\n附件：\n");
-        effective_prompt.push_str(&lines.join("\n"));
+        if !lines.is_empty() {
+            effective_prompt.push_str("\n\n附件：\n");
+            effective_prompt.push_str(&lines.join("\n"));
+        }
     }
 
     let turn_lock = {
@@ -1309,6 +1658,16 @@ async fn turn(
     let approver = ChannelApprover {
         pending: Arc::clone(&state.pending_approvals),
         pending_sessions: Arc::clone(&state.pending_approval_sessions),
+        details: Arc::clone(&state.pending_approval_details),
+        session_id: id.clone(),
+        abort: Arc::clone(&abort_flag),
+        tx: tx.clone(),
+    };
+    // ask_user 通道：提问经同一 SSE 流下发（user_question），应答走 /session/{id}/answer/{qid}。
+    let questioner = ChannelQuestioner {
+        tx: tx.clone(),
+        pending: Arc::clone(&state.pending_questions),
+        pending_sessions: Arc::clone(&state.pending_question_sessions),
         session_id: id.clone(),
         abort: Arc::clone(&abort_flag),
     };
@@ -1318,12 +1677,17 @@ async fn turn(
     let sessions = Arc::clone(&state.sessions);
     let traces_dir = state.traces_dir.clone();
     let state_for_audit = Arc::clone(&state);
+    let activity_state = Arc::clone(&state);
+    let activity_sid = id.clone();
     tokio::spawn(async move {
         let _turn_guard = turn_guard;
         let _concurrency_permit = concurrency_permit;
         let mut current = session;
         let stream_abort = Arc::clone(&abort_flag);
+        // A8-2：登记活跃回合（桌宠等外部进度面板轮询 /activity）。
+        begin_activity(&activity_state, &current.id);
         let mut on_event = |event: &owo_agent_core::TurnEvent| {
+            update_activity(&activity_state, &activity_sid, event);
             if let Some(sse) = to_sse(event) {
                 if tx.send(to_event(sse)).is_err() {
                     // 客户端断开后尽快停止后续模型/工具调用，避免无主任务继续消耗资源。
@@ -1332,10 +1696,12 @@ async fn turn(
             }
         };
         match agent
-            .run_turn(
+            .run_turn_with_images(
                 &mut current,
                 &effective_prompt,
+                &attachment_images,
                 &approver,
+                Some(&questioner),
                 &abort_flag,
                 &mut on_event,
             )
@@ -1344,16 +1710,16 @@ async fn turn(
             Ok(outcome) => {
                 let trace = owo_agent_core::TraceRecord::from_outcome(&current, &outcome);
                 let _ = owo_agent_core::save_trace(&traces_dir, &trace);
+                let input_price = std::env::var("OWO_MODEL_INPUT_PRICE_PER_MTOK")
+                    .ok()
+                    .and_then(|value| value.parse::<f64>().ok())
+                    .unwrap_or(0.0);
+                let output_price = std::env::var("OWO_MODEL_OUTPUT_PRICE_PER_MTOK")
+                    .ok()
+                    .and_then(|value| value.parse::<f64>().ok())
+                    .unwrap_or(0.0);
+                let cost = outcome.usage.cost_estimate_usd(input_price, output_price);
                 if outcome.usage.total_tokens > 0 {
-                    let input_price = std::env::var("OWO_MODEL_INPUT_PRICE_PER_MTOK")
-                        .ok()
-                        .and_then(|value| value.parse::<f64>().ok())
-                        .unwrap_or(0.0);
-                    let output_price = std::env::var("OWO_MODEL_OUTPUT_PRICE_PER_MTOK")
-                        .ok()
-                        .and_then(|value| value.parse::<f64>().ok())
-                        .unwrap_or(0.0);
-                    let cost = outcome.usage.cost_estimate_usd(input_price, output_price);
                     if let Ok(mut audit) = state_for_audit.agent.audit_log().lock() {
                         audit.record(
                             "model",
@@ -1378,6 +1744,15 @@ async fn turn(
                         outcome.usage.completion_tokens,
                     );
                 }
+                // 回合统计补发：前端汇报卡展示步数/耗时/消耗（final 之后到达，前端补填卡片）。
+                let _ = tx.send(to_event(SseEvent::TurnStats {
+                    steps: outcome.steps,
+                    duration_ms: outcome.duration_ms,
+                    prompt_tokens: outcome.usage.prompt_tokens,
+                    completion_tokens: outcome.usage.completion_tokens,
+                    total_tokens: outcome.usage.total_tokens,
+                    cost_usd: cost,
+                }));
             }
             Err(error) => {
                 logging::error(
@@ -1386,11 +1761,17 @@ async fn turn(
                     "回合执行失败",
                     &[("session_id", serde_json::json!(current.id))],
                 );
-                let _ = tx.send(to_event(SseEvent::Progress {
-                    message: format!("turn failed: {error}"),
-                }));
+                // 失败必须有专属终态事件：旧的裸 progress 行会让前端停在「执行中」，
+                // 用户感知为「思考完就卡住」。
+                let message = match error {
+                    owo_agent_core::AgentError::Aborted => "已中断回合".to_string(),
+                    other => other.to_string(),
+                };
+                let _ = tx.send(to_event(SseEvent::TurnFailed { message }));
             }
         }
+        // A8-2：回合结束（含失败/中止）清除活跃快照。
+        end_activity(&state_for_audit, &current.id);
         if let Ok(mut sessions) = sessions.lock() {
             sessions.insert(current.id.clone(), current.clone());
         }
@@ -1411,6 +1792,187 @@ async fn turn(
     });
 
     Ok(Sse::new(UnboundedReceiverStream::new(rx)))
+}
+
+// ===== A8-2 活跃回合快照（/activity）=====
+// 桌宠等外部进度面板的只读数据源：哪个会话在跑、什么阶段、是否有待审批。
+// 快照只存最小状态；会话标题等展示信息由 /activity handler 现取。
+
+fn begin_activity(state: &AppState, session_id: &str) {
+    let Ok(mut activities) = state.activities.lock() else {
+        return;
+    };
+    let now = chrono::Utc::now().to_rfc3339();
+    activities.insert(
+        session_id.to_string(),
+        json!({
+            "session_id": session_id,
+            "phase": "starting",
+            "tool": Value::Null,
+            "started_at": now,
+            "updated_at": now,
+        }),
+    );
+}
+
+fn end_activity(state: &AppState, session_id: &str) {
+    if let Ok(mut activities) = state.activities.lock() {
+        activities.remove(session_id);
+    }
+}
+
+fn update_activity(state: &AppState, session_id: &str, event: &owo_agent_core::TurnEvent) {
+    use owo_agent_core::TurnEvent;
+    let Ok(mut activities) = state.activities.lock() else {
+        return;
+    };
+    let now = chrono::Utc::now().to_rfc3339();
+    let touch = |activities: &mut HashMap<String, Value>, phase: &str| {
+        let entry = activities.entry(session_id.to_string()).or_insert_with(|| {
+            json!({ "session_id": session_id, "started_at": now, "tool": Value::Null })
+        });
+        entry["phase"] = json!(phase);
+        entry["updated_at"] = json!(now);
+    };
+    match event {
+        TurnEvent::ModelCall => touch(&mut activities, "thinking"),
+        TurnEvent::TokenDelta { .. } | TurnEvent::ReasoningDelta { .. } => {
+            touch(&mut activities, "speaking");
+        }
+        TurnEvent::ToolStart { tool, .. } => {
+            touch(&mut activities, "tool");
+            if let Some(entry) = activities.get_mut(session_id) {
+                entry["tool"] = json!(tool);
+            }
+        }
+        TurnEvent::PermissionRequest(request) => {
+            touch(&mut activities, "waiting_approval");
+            if let Some(entry) = activities.get_mut(session_id) {
+                entry["tool"] = json!(request.tool);
+                entry["request_id"] = json!(request.request_id);
+                entry["reason"] = json!(request.reason);
+            }
+        }
+        TurnEvent::Final { .. } => {
+            activities.remove(session_id);
+        }
+        _ => {}
+    }
+}
+
+/// A8-2：`GET /activity`——活跃回合快照（附会话标题/工作区 + 待审批计数）。
+async fn activity_list(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let mut list: Vec<Value> = {
+        let activities = state.activities.lock().map_err(poison)?;
+        activities.values().cloned().collect()
+    };
+    for item in list.iter_mut() {
+        if let Some(sid) = item.get("session_id").and_then(Value::as_str) {
+            if let Ok(session) = load_session(&state, sid) {
+                item["title"] = json!(session.display_title());
+                item["workspace"] = json!(session.workspace.to_string_lossy());
+            }
+        }
+    }
+    let pending = state.pending_approvals.lock().map_err(poison)?.len();
+    Ok(Json(json!({
+        "active": list,
+        "pending_approvals": pending,
+    })))
+}
+
+/// A8-3：桌宠状态 JSON（`overlay_online` = 最近 15 秒收到过桌面端心跳）。
+fn pet_state_json(state: &AppState) -> Value {
+    let pet = match state.pet_state.lock() {
+        Ok(pet) => pet,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let online = pet
+        .actual_seen
+        .map(|seen| seen.elapsed() < Duration::from_secs(15))
+        .unwrap_or(false);
+    json!({
+        "desired": pet.desired,
+        "desired_at": pet.desired_at,
+        "actual": pet.actual,
+        "actual_at": pet.actual_at,
+        "overlay_online": online,
+    })
+}
+
+/// A8-3：`GET /desktop/pet`——桌宠显隐状态（工作台读开关与在线情况）。
+/// 桌面端在线且实际值与期望值不一致时，以实际值为准回写期望（用户可能直接在
+/// 桌宠/面板上切换过；避免下次桌面端启动被旧期望值"复活"）。
+async fn pet_state_get(State(state): State<Arc<AppState>>) -> Json<Value> {
+    {
+        if let Ok(mut pet) = state.pet_state.lock() {
+            let online = pet
+                .actual_seen
+                .map(|seen| seen.elapsed() < Duration::from_secs(15))
+                .unwrap_or(false);
+            if online {
+                if let Some(actual) = pet.actual {
+                    // 只有「实际值比期望值更新」才回写（用户在桌宠/面板上直接改过）；
+                    // 期望值更新说明工作台刚写入、桌面端尚未跟进，**不能**回写，
+                    // 否则命令会被立即吞掉（已实测开关拨不动）。
+                    let actual_at = pet
+                        .actual_at
+                        .as_deref()
+                        .and_then(|text| chrono::DateTime::parse_from_rfc3339(text).ok());
+                    let desired_at = pet
+                        .desired_at
+                        .as_deref()
+                        .and_then(|text| chrono::DateTime::parse_from_rfc3339(text).ok());
+                    let actual_is_newer = match (actual_at, desired_at) {
+                        (Some(actual_at), Some(desired_at)) => actual_at > desired_at,
+                        (Some(_), None) => true,
+                        _ => false,
+                    };
+                    if pet.desired != Some(actual) && actual_is_newer {
+                        pet.desired = Some(actual);
+                        pet.desired_at = Some(chrono::Utc::now().to_rfc3339());
+                    }
+                }
+            }
+        }
+    }
+    Json(pet_state_json(&state))
+}
+
+#[derive(serde::Deserialize)]
+struct PetVisibleRequest {
+    visible: bool,
+}
+
+/// A8-3：`POST /desktop/pet`——工作台开关写入期望显隐；桌面端下一轮心跳应用。
+async fn pet_state_set(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<PetVisibleRequest>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    {
+        let mut pet = state.pet_state.lock().map_err(poison)?;
+        pet.desired = Some(request.visible);
+        pet.desired_at = Some(chrono::Utc::now().to_rfc3339());
+    }
+    Ok(Json(pet_state_json(&state)))
+}
+
+/// A8-3：`POST /desktop/pet/report`——桌面端心跳：上报实际显隐，回传期望值
+/// （桌面端据此做差异化同步：期望 ≠ 实际时立即切换）。
+async fn pet_state_report(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<PetVisibleRequest>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let desired = {
+        let mut pet = state.pet_state.lock().map_err(poison)?;
+        pet.actual = Some(request.visible);
+        pet.actual_at = Some(chrono::Utc::now().to_rfc3339());
+        pet.actual_seen = Some(std::time::Instant::now());
+        pet.desired
+    };
+    Ok(Json(json!({ "desired": desired })))
 }
 
 fn attachment_dir(workspace: &Path, session_id: &str) -> std::path::PathBuf {
@@ -1512,24 +2074,42 @@ async fn attachments_list(
     Ok(Json(attachments))
 }
 
+/// 跨会话待审批列表：多对话并行时，其他会话的审批卡也要对用户可见可响应
+/// （否则会话 A 等审批期间用户停在会话 B，A 只能等 300s 超时被拒）。
+async fn pending_approvals_list(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let pending = state.pending_approvals.lock().map_err(poison)?;
+    let sessions = state.pending_approval_sessions.lock().map_err(poison)?;
+    let details = state.pending_approval_details.lock().map_err(poison)?;
+    let items: Vec<Value> = pending
+        .keys()
+        .map(|request_id| {
+            let (tool, args) = details
+                .get(request_id)
+                .cloned()
+                .unwrap_or_else(|| (String::new(), serde_json::Value::Null));
+            json!({
+                "request_id": request_id,
+                "session_id": sessions.get(request_id),
+                "tool": tool,
+                "args_summary": args.to_string().chars().take(120).collect::<String>(),
+            })
+        })
+        .collect();
+    Ok(Json(json!({ "count": items.len(), "pending": items })))
+}
+
 async fn respond_permission(
     State(state): State<Arc<AppState>>,
     AxumPath((session_id, request_id)): AxumPath<(String, String)>,
     Json(response): Json<PermissionResponse>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    let belongs_to_session = state
-        .pending_approval_sessions
-        .lock()
-        .map_err(poison)?
-        .get(&request_id)
-        .map(|pending_session| pending_session == &session_id)
-        .unwrap_or(false);
-    if !belongs_to_session {
-        return Err((
-            StatusCode::NOT_FOUND,
-            format!("审批请求不存在：{request_id}"),
-        ));
-    }
+    // 会话归属只做软校验：UI 在「恢复会话 / 多标签页」场景下可能带着别的会话 id
+    // 来响应（state.sessionId 与 turn 所在会话脱节）。若硬拒绝（unwrap_or(false) →
+    // 404），审批将永远等不到决策、本轮所有工具全部 Deny（真机实测：完全访问模式
+    // 下连续 404）。request_id 为 uuid v4 且服务仅监听本机，跨会话响应无伪造面；
+    // 错位记入审计后照常处理。
     let sender = state
         .pending_approvals
         .lock()
@@ -1541,11 +2121,75 @@ async fn respond_permission(
                 format!("审批请求不存在：{request_id}"),
             )
         })?;
-    state
+    let registered_session = state
         .pending_approval_sessions
         .lock()
         .map_err(poison)?
         .remove(&request_id);
+    if registered_session.as_deref() != Some(session_id.as_str()) {
+        if let Ok(mut audit) = state.agent.audit_log().lock() {
+            audit.record(
+                registered_session.as_deref().unwrap_or(&session_id),
+                "permission",
+                Some("cross_session_respond".to_string()),
+                Some(response.allow),
+                format!("审批响应的 URL 会话（{session_id}）与注册会话不一致，已按注册会话处理"),
+            );
+        }
+    }
+    // remember=true 且在放行场景：生成权限规则（A6-1 三档：session=内存临时 /
+    // forever=落盘）并审计（硬拒绝类命令不可记住）。
+    if response.remember == Some(true) && response.allow {
+        let details = state
+            .pending_approval_details
+            .lock()
+            .map_err(poison)?
+            .remove(&request_id);
+        if let Some((tool, args)) = details {
+            let session_scope =
+                response.remember_scope.as_deref() == Some("session");
+            let remembered = if session_scope {
+                state.agent.policy().remember_session_rule(&tool, &args)
+            } else {
+                state.agent.policy().remember_rule(&tool, &args, None)
+            };
+            match remembered {
+                Some(rule) => {
+                    if !session_scope {
+                        let workspace = state.workspace.clone();
+                        let rules = state.agent.policy().rules();
+                        if let Err(error) = persist_permission_rules(&workspace, rules) {
+                            tracing::warn!("权限规则持久化失败：{error}");
+                        }
+                    }
+                    let scope_label = if session_scope { "本会话" } else { "永久" };
+                    if let Ok(mut audit) = state.agent.audit_log().lock() {
+                        audit.record(
+                            "permission",
+                            "remember",
+                            Some(session_id.clone()),
+                            Some(true),
+                            format!(
+                                "记住权限规则（{scope_label}）：{} {}",
+                                rule.tool, rule.pattern
+                            ),
+                        );
+                    }
+                }
+                None => {
+                    if let Ok(mut audit) = state.agent.audit_log().lock() {
+                        audit.record(
+                            "permission",
+                            "remember",
+                            Some(session_id.clone()),
+                            Some(false),
+                            format!("该操作不可记住（危险命令）：{tool}"),
+                        );
+                    }
+                }
+            }
+        }
+    }
     let decision = if response.allow {
         Decision::Allow
     } else {
@@ -1554,6 +2198,124 @@ async fn respond_permission(
     sender
         .send(decision)
         .map_err(|_| (StatusCode::GONE, "审批通道已关闭".to_string()))?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+/// 把权限规则持久化到 workspace 的 `settings.json`（保留 provider 等其他设置节）。
+fn persist_permission_rules(
+    workspace: &Path,
+    rules: Vec<owo_agent_core::PermissionRule>,
+) -> Result<(), String> {
+    let mut settings = owo_agent_core::Settings::load_encrypted(workspace)
+        .unwrap_or_else(|_| owo_agent_core::Settings::load(workspace));
+    settings.permissions.rules = rules;
+    settings.save(workspace)
+}
+
+/// `GET /permissions/rules`（B4-1 规则管理）：持久规则 + 会话临时规则。
+async fn permission_rules_list(State(state): State<Arc<AppState>>) -> Json<Value> {
+    let policy = state.agent.policy();
+    Json(json!({
+        "rules": policy.rules(),
+        "session_rules": policy.session_rules(),
+    }))
+}
+
+#[derive(serde::Deserialize)]
+struct RemoveRuleRequest {
+    tool: String,
+    pattern: String,
+    /// `session` = 内存临时表；缺省 = 持久表（同步写回 settings.json）。
+    #[serde(default)]
+    scope: Option<String>,
+}
+
+/// `POST /permissions/rules/remove`（B4-1）：删除一条规则。
+async fn remove_permission_rule(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<RemoveRuleRequest>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let session = request.scope.as_deref() == Some("session");
+    let removed = state
+        .agent
+        .policy()
+        .remove_rule(&request.tool, &request.pattern, session);
+    if removed && !session {
+        let workspace = state.workspace.clone();
+        let rules = state.agent.policy().rules();
+        if let Err(error) = persist_permission_rules(&workspace, rules) {
+            tracing::warn!("权限规则持久化失败：{error}");
+        }
+    }
+    if removed {
+        if let Ok(mut audit) = state.agent.audit_log().lock() {
+            audit.record(
+                "permission",
+                "remove_rule",
+                None,
+                None,
+                format!(
+                    "删除权限规则（{}）：{} {}",
+                    if session { "本会话" } else { "永久" },
+                    request.tool,
+                    request.pattern
+                ),
+            );
+        }
+    }
+    Ok(Json(json!({ "ok": true, "removed": removed })))
+}
+
+#[derive(serde::Deserialize)]
+struct QuestionResponse {
+    answer: String,
+}
+
+/// 用户提交对 ask_user 提问的回答：唤醒挂起中的回合。
+async fn respond_question(
+    State(state): State<Arc<AppState>>,
+    AxumPath((session_id, question_id)): AxumPath<(String, String)>,
+    Json(response): Json<QuestionResponse>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let belongs_to_session = state
+        .pending_question_sessions
+        .lock()
+        .map_err(poison)?
+        .get(&question_id)
+        .map(|pending_session| pending_session == &session_id)
+        .unwrap_or(false);
+    if !belongs_to_session {
+        return Err((
+            StatusCode::NOT_FOUND,
+            format!("提问不存在或已结束：{question_id}"),
+        ));
+    }
+    let sender = state
+        .pending_questions
+        .lock()
+        .map_err(poison)?
+        .remove(&question_id)
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                format!("提问不存在或已结束：{question_id}"),
+            )
+        })?;
+    state
+        .pending_question_sessions
+        .lock()
+        .map_err(poison)?
+        .remove(&question_id);
+    let answer = response.answer.trim().to_string();
+    if answer.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "回答不能为空".to_string()));
+    }
+    sender
+        .send(QuestionAnswer {
+            question_id,
+            answer,
+        })
+        .map_err(|_| (StatusCode::GONE, "提问通道已关闭".to_string()))?;
     Ok(Json(json!({ "ok": true })))
 }
 
@@ -1623,14 +2385,13 @@ async fn rewind_session(
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let _session_guard = acquire_session_lock(&state, &id).await?;
     let mut session = load_session(&state, &id)?;
-    if request.keep < session.messages.len() {
-        session.revert().await.map_err(|error| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("回滚失败：{error}"),
-            )
-        })?;
-    }
+    // 只回滚被截断段落的文件改动：更早回合的快照保留（/diff 与 /revert 仍可见）。
+    session.revert_from(request.keep).await.map_err(|error| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("回滚失败：{error}"),
+        )
+    })?;
     let removed = session.rewind(request.keep);
     state
         .store
@@ -1718,6 +2479,24 @@ async fn session_archive(
     Ok(Json(to_session_info(&session)))
 }
 
+/// 删除会话（对标 Codex 侧栏可删线程；此前只能归档，长列表迟早爆）。
+/// 只删会话记录本身：审计留痕与文件快照不级联；fork 子会话保留（父消失后按根会话显示）。
+async fn session_delete(
+    State(state): State<Arc<AppState>>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let _session_guard = acquire_session_lock(&state, &id).await?;
+    let removed = state
+        .store
+        .delete(&id)
+        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    if !removed {
+        return Err((StatusCode::NOT_FOUND, format!("会话不存在：{id}")));
+    }
+    state.sessions.lock().map_err(poison)?.remove(&id);
+    Ok(Json(json!({ "ok": true, "deleted": id })))
+}
+
 async fn session_pin(
     State(state): State<Arc<AppState>>,
     AxumPath(id): AxumPath<String>,
@@ -1790,7 +2569,8 @@ async fn run_eval(
             ))
         }
     };
-    let model = std::env::var("OPENAI_MODEL").unwrap_or_else(|_| "deepseek-v4-flash".to_string());
+    let model = std::env::var("OPENAI_MODEL")
+        .unwrap_or_else(|_| owo_agent_core::gateway::DEFAULT_MODEL.to_string());
     let provider = state.agent.provider();
     let report = owo_agent_core::run_suite(provider, &model, &suite).await;
     Ok(Json(report))
@@ -3199,7 +3979,12 @@ async fn stt_transcribe(
 struct CreateAutomationRequest {
     name: String,
     schedule: Schedule,
-    reminder: String,
+    /// 兼容旧契约：纯提醒任务（与 action 二选一，action 优先）。
+    #[serde(default)]
+    reminder: Option<String>,
+    /// A8-1：通用动作（reminder / run_prompt）。
+    #[serde(default)]
+    action: Option<AutomationAction>,
 }
 
 async fn automations_list(
@@ -3213,18 +3998,40 @@ async fn automations_create(
     State(state): State<Arc<AppState>>,
     Json(request): Json<CreateAutomationRequest>,
 ) -> Result<Json<AutomationTask>, (StatusCode, String)> {
-    let task = AutomationTask::new(
-        &request.name,
-        request.schedule,
-        AutomationAction::Reminder {
-            text: request.reminder,
-        },
-    );
+    let action = request
+        .action
+        .or_else(|| {
+            request
+                .reminder
+                .map(|text| AutomationAction::Reminder { text })
+        })
+        .ok_or_else(|| {
+            (
+                StatusCode::BAD_REQUEST,
+                "缺少动作：reminder 或 action 必填".to_string(),
+            )
+        })?;
+    let task = AutomationTask::new(&request.name, request.schedule, action);
     let mut automations = state.automations.lock().map_err(poison)?;
     automations
         .upsert(task.clone())
         .map_err(|error| (StatusCode::BAD_REQUEST, error))?;
     Ok(Json(task))
+}
+
+/// A8-1：执行记录查询（`?task_id=&limit=`；时间倒序）。
+async fn automations_runs(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Result<Json<Vec<AutomationRun>>, (StatusCode, String)> {
+    let limit = params
+        .get("limit")
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(50)
+        .min(200);
+    let task_id = params.get("task_id").map(String::as_str);
+    let automations = state.automations.lock().map_err(poison)?;
+    Ok(Json(automations.runs(task_id, limit)))
 }
 
 async fn automations_toggle(
@@ -3269,8 +4076,19 @@ async fn automations_clear_reminders(
 #[cfg(test)]
 mod tests {
     use super::{
-        auto_approve_enabled, rewind_session, sanitize_attachment_name, AppState, RewindRequest,
+        auto_approve_enabled, normalize_opener, rewind_session, sanitize_attachment_name, AppState,
+        RewindRequest,
     };
+
+    /// 打开方式白名单：未知取值/空值一律回落系统默认，绝不把任意字符串当命令执行。
+    #[test]
+    fn opener_whitelist_falls_back_to_system() {
+        assert_eq!(normalize_opener(Some("vscode")), "vscode");
+        assert_eq!(normalize_opener(Some("  NotePad ")), "notepad");
+        assert_eq!(normalize_opener(Some("cmd /c calc")), "system");
+        assert_eq!(normalize_opener(Some("")), "system");
+        assert_eq!(normalize_opener(None), "system");
+    }
     use async_trait::async_trait;
     use base64::Engine;
     use owo_agent_core::permissions::Policy;
@@ -3337,14 +4155,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rewind_endpoint_restores_files_before_saving_session() {
+    async fn rewind_endpoint_rolls_back_only_truncated_turn_files() {
         let root = std::env::temp_dir().join(format!("owo-server-rewind-{}", uuid::Uuid::new_v4()));
         let workspace = root.join("workspace");
         let data_root = root.join("data");
         std::fs::create_dir_all(&workspace).unwrap();
         std::fs::create_dir_all(&data_root).unwrap();
-        let path = workspace.join("changed.txt");
-        std::fs::write(&path, "after").unwrap();
+        let kept_path = workspace.join("kept.txt");
+        let changed_path = workspace.join("changed.txt");
+        std::fs::write(&kept_path, "after").unwrap();
+        std::fs::write(&changed_path, "after").unwrap();
 
         let agent = Agent::new(
             Arc::new(IdleProvider),
@@ -3363,10 +4183,24 @@ mod tests {
         let mut session = Session::new(&workspace, "mock", None);
         session.push(ChatMessage::user("first".to_string()));
         session.push(ChatMessage::assistant_text("reply".to_string()));
+        session.push(ChatMessage::user("second".to_string()));
+        session.push(ChatMessage::assistant_text("reply2".to_string()));
+        let encode = |text: &str| Some(base64::engine::general_purpose::STANDARD.encode(text));
+        // 第 0 回合写入的 kept.txt（保留段）与第 2 回合写入的 changed.txt（被截断段）。
+        let kept_key = kept_path.to_string_lossy().replace('\\', "/");
+        let changed_key = changed_path.to_string_lossy().replace('\\', "/");
         session.snapshots.insert(
-            path.to_string_lossy().replace('\\', "/"),
+            kept_key.clone(),
             owo_agent_core::session::SnapshotEntry {
-                original_b64: Some(base64::engine::general_purpose::STANDARD.encode("before")),
+                original_b64: encode("before"),
+                turn: 0,
+            },
+        );
+        session.snapshots.insert(
+            changed_key,
+            owo_agent_core::session::SnapshotEntry {
+                original_b64: encode("before"),
+                turn: 2,
             },
         );
         state.store.save(&session).unwrap();
@@ -3380,26 +4214,32 @@ mod tests {
         let response = rewind_session(
             axum::extract::State(Arc::clone(&state)),
             axum::extract::Path(id.clone()),
-            axum::Json(RewindRequest { keep: 1 }),
+            axum::Json(RewindRequest { keep: 2 }),
         )
         .await
         .unwrap()
         .0;
 
         assert_eq!(response["ok"], json!(true));
-        assert_eq!(response["removed"], json!(1));
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "before");
-        assert_eq!(state.store.load(&id).unwrap().messages.len(), 1);
+        assert_eq!(response["removed"], json!(2));
+        // 被截断回合的文件回滚；更早回合的文件与其快照原样保留。
+        assert_eq!(std::fs::read_to_string(&changed_path).unwrap(), "before");
+        assert_eq!(std::fs::read_to_string(&kept_path).unwrap(), "after");
+        let stored = state.store.load(&id).unwrap();
+        assert_eq!(stored.messages.len(), 2);
+        assert_eq!(stored.snapshots.len(), 1);
+        assert!(stored.snapshots.contains_key(&kept_key));
         let _ = std::fs::remove_dir_all(root);
     }
 }
 
-/// 自动化常驻循环：每秒检查到期任务，触发提醒并写审计。
+/// 自动化常驻循环：每秒检查到期任务。提醒压入列表；RunPrompt（A8-1）在后台
+/// 跑一个只读 Agent 回合并写入 run 记录（不阻塞调度循环）。
 pub async fn start_automation_loop(state: Arc<AppState>) {
     let mut interval = tokio::time::interval(Duration::from_secs(1));
     loop {
         interval.tick().await;
-        let fired = {
+        let fired: Vec<(String, String, AutomationAction)> = {
             let mut automations = state
                 .automations
                 .lock()
@@ -3407,17 +4247,133 @@ pub async fn start_automation_loop(state: Arc<AppState>) {
             let now = chrono::Utc::now();
             let mut fired = Vec::new();
             for id in automations.due_tasks(now) {
-                if let Ok(text) = automations.fire(&id, now) {
-                    fired.push(text);
+                let name = automations
+                    .get(&id)
+                    .map(|task| task.name.clone())
+                    .unwrap_or_default();
+                if let Ok(action) = automations.fire(&id, now) {
+                    fired.push((id, name, action));
                 }
             }
             fired
         };
-        if !fired.is_empty() {
-            if let Ok(mut audit) = state.agent.audit_log().lock() {
-                audit.record("automation", "fire", None, Some(true), fired.join(" | "));
+        let mut fired_texts = Vec::new();
+        for (id, name, action) in fired {
+            match action {
+                AutomationAction::Reminder { text } => fired_texts.push(text),
+                AutomationAction::RunPrompt { prompt, session_id } => {
+                    fired_texts.push(format!("运行任务「{name}」"));
+                    tokio::spawn(run_automation_prompt(
+                        Arc::clone(&state),
+                        id,
+                        name,
+                        prompt,
+                        session_id,
+                    ));
+                }
             }
         }
+        if !fired_texts.is_empty() {
+            if let Ok(mut audit) = state.agent.audit_log().lock() {
+                audit.record("automation", "fire", None, Some(true), fired_texts.join(" | "));
+            }
+        }
+    }
+}
+
+/// A8-1：执行一次 RunPrompt——续跑指定会话或新建独立会话。
+///
+/// 审批策略：**无人在场不能授权**——`AutoApprover { allow: false }` 只拒绝
+/// Write/Execute/Inject 档（读文件/搜索/git 读等 Read 档在 Policy 层即免审批），
+/// 因此自动化任务能做只读分析，不能写文件或执行命令。
+async fn run_automation_prompt(
+    state: Arc<AppState>,
+    task_id: String,
+    task_name: String,
+    prompt: String,
+    session_id: Option<String>,
+) {
+    // 会话：续跑既有 / 新建独立会话（服务默认工作区）。
+    let mut session = match session_id.as_deref() {
+        Some(id) => match load_session(&state, id) {
+            Ok(session) => session,
+            Err((_, error)) => {
+                record_automation_run(
+                    &state,
+                    &task_id,
+                    &task_name,
+                    "failed",
+                    Some(format!("会话不可用：{error}")),
+                );
+                return;
+            }
+        },
+        None => {
+            let model = std::env::var("OPENAI_MODEL")
+                .unwrap_or_else(|_| owo_agent_core::gateway::DEFAULT_MODEL.to_string());
+            Session::new(&state.workspace, model, None)
+        }
+    };
+    let approver = owo_agent_core::permissions::AutoApprover { allow: false };
+    let abort = AtomicBool::new(false);
+    let mut on_event = |_event: &owo_agent_core::TurnEvent| {};
+    let result = state
+        .agent
+        .run_turn_with_asker(&mut session, &prompt, &approver, None, &abort, &mut on_event)
+        .await;
+    match result {
+        Ok(outcome) => {
+            let text = outcome
+                .final_text
+                .unwrap_or_else(|| format!("（无最终文本，共 {} 步）", outcome.steps));
+            // 输出截断到 4000 字符（run 记录只是摘要视图）。
+            let summary: String = text.chars().take(4000).collect();
+            if let Ok(mut sessions) = state.sessions.lock() {
+                sessions.insert(session.id.clone(), session.clone());
+            }
+            if let Err(error) = state.store.save(&session) {
+                tracing::warn!(?error, "自动化会话持久化失败");
+            }
+            record_automation_run(&state, &task_id, &task_name, "ok", Some(summary));
+        }
+        Err(error) => record_automation_run(
+            &state,
+            &task_id,
+            &task_name,
+            "failed",
+            Some(error.to_string()),
+        ),
+    }
+}
+
+/// A8-1：写 run 记录 + 审计（两条路径共用）。
+fn record_automation_run(
+    state: &AppState,
+    task_id: &str,
+    task_name: &str,
+    status: &str,
+    output: Option<String>,
+) {
+    let run = AutomationRun {
+        task_id: task_id.to_string(),
+        task_name: task_name.to_string(),
+        at: chrono::Utc::now().to_rfc3339(),
+        status: status.to_string(),
+        output,
+    };
+    if let Ok(mut automations) = state.automations.lock() {
+        if let Err(error) = automations.record_run(run) {
+            tracing::warn!(?error, "自动化 run 记录写入失败");
+        }
+    }
+    if let Ok(mut audit) = state.agent.audit_log().lock() {
+        audit.record(
+            "automation",
+            "run",
+            Some(task_id.to_string()),
+            Some(status == "ok"),
+            format!("{task_name}：{status}"),
+        );
     }
 }
 
@@ -3488,10 +4444,23 @@ pub async fn start_memory_observer(state: Arc<AppState>) {
 async fn settings_get(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    let settings = owo_agent_core::Settings::load(&state.workspace);
-    serde_json::to_value(&settings)
-        .map(Json)
-        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))
+    let settings = owo_agent_core::Settings::load_encrypted(&state.workspace)
+        .unwrap_or_else(|_| owo_agent_core::Settings::load(&state.workspace));
+    let mut value = serde_json::to_value(&settings)
+        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    // 密钥不回传前端：只告知是否已保存（DPAPI 信封），明文绝不出现在响应里。
+    let key_set = settings
+        .provider
+        .api_key
+        .as_deref()
+        .map(|key| !key.trim().is_empty())
+        .unwrap_or(false);
+    if let Some(provider) = value.get_mut("provider") {
+        provider["api_key"] = serde_json::Value::Null;
+        provider["api_key_set"] = serde_json::Value::Bool(key_set);
+    }
+    value["provider_ready"] = serde_json::Value::Bool(owo_agent_core::gateway::provider_ready());
+    Ok(Json(value))
 }
 
 #[derive(serde::Deserialize)]
@@ -3540,14 +4509,19 @@ async fn settings_update(
         .save(&state.workspace)
         .map_err(|error| (StatusCode::BAD_REQUEST, error))?;
     settings.apply_usage_env();
+    settings.apply_reasoning_env();
     state
         .agent
         .apply_policy_settings(settings.read_only, &settings.deny_commands);
-    if let Some(model) = &settings.model {
-        if !model.trim().is_empty() {
-            std::env::set_var("OPENAI_MODEL", model);
-        }
-    }
+    // A2-1：settings 保存后热重灌 hooks（下次工具调用/回合即生效）。
+    state.agent.set_hooks(owo_agent_core::hooks::HookManager::from_configs(
+        &settings.hooks,
+    ));
+    // 让设置页保存的接入配置即时生效，并优先于启动终端的环境变量。
+    // 密钥留空时保留加密信封里的旧值（save 的合并语义），前端因此永远拿不到 key。
+    let effective = owo_agent_core::Settings::load_encrypted(&state.workspace)
+        .unwrap_or_else(|_| owo_agent_core::Settings::load(&state.workspace));
+    effective.apply_provider_override();
     std::env::set_var(
         "OWO_CLOUD_ENABLED",
         settings.egress.cloud_enabled.to_string(),
@@ -3664,8 +4638,12 @@ async fn whitelist_manage(
 struct ChannelApprover {
     pending: Arc<Mutex<HashMap<String, tokio::sync::oneshot::Sender<Decision>>>>,
     pending_sessions: Arc<Mutex<HashMap<String, String>>>,
+    /// 请求原文（`request_id → (tool, args)`）：`remember` 生成规则所需。
+    details: Arc<Mutex<HashMap<String, (String, Value)>>>,
     session_id: String,
     abort: Arc<AtomicBool>,
+    /// 回合 SSE 通道（B1-5：审批终态 `permission_resolved` 回执）。
+    tx: mpsc::UnboundedSender<Result<Event, Infallible>>,
 }
 
 impl ChannelApprover {
@@ -3680,6 +4658,12 @@ impl ChannelApprover {
         if let Ok(mut sessions) = self.pending_sessions.lock() {
             sessions.insert(request.request_id.clone(), self.session_id.clone());
         }
+        if let Ok(mut details) = self.details.lock() {
+            details.insert(
+                request.request_id.clone(),
+                (request.tool.clone(), request.args.clone()),
+            );
+        }
         rx
     }
 }
@@ -3692,14 +4676,19 @@ impl Approver for ChannelApprover {
         }
         let rx = self.spawn_request(request);
         let mut rx = rx;
+        let mut source = "timeout";
         let deadline = tokio::time::sleep(std::time::Duration::from_secs(300));
         tokio::pin!(deadline);
         let decision = loop {
             tokio::select! {
-                result = &mut rx => break result.unwrap_or(Decision::Deny),
+                result = &mut rx => {
+                    source = "user";
+                    break result.unwrap_or(Decision::Deny);
+                }
                 _ = &mut deadline => break Decision::Deny,
                 _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {
                     if self.abort.load(Ordering::Relaxed) {
+                        source = "aborted";
                         break Decision::Deny;
                     }
                 }
@@ -3711,6 +4700,16 @@ impl Approver for ChannelApprover {
         if let Ok(mut sessions) = self.pending_sessions.lock() {
             sessions.remove(&request.request_id);
         }
+        if let Ok(mut details) = self.details.lock() {
+            details.remove(&request.request_id);
+        }
+        // B1-5 终态回执：前端据此关闭审批卡（超时/中止显示对应提示，
+        // 而不是留下一个点了会报错的卡片）。
+        let _ = self.tx.send(to_event(SseEvent::PermissionResolved {
+            request_id: request.request_id.clone(),
+            source: source.to_string(),
+            allowed: matches!(decision, Decision::Allow),
+        }));
         decision
     }
 }
@@ -3721,12 +4720,93 @@ fn auto_approve_enabled() -> bool {
         .unwrap_or(false)
 }
 
+/// 提问默认等待时限（秒）：超过后结论以「用户未回答」返回，回合继续而不是挂死。
+/// 取 10 分钟——用户要求「拿不准的先问用户」，等待应足够宽松，但不能无限期占用回合。
+fn question_timeout_secs() -> u64 {
+    std::env::var("OWO_QUESTION_TIMEOUT_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(600)
+}
+
+/// ask_user 工具的 SSE 实现：把提问推给当前回合的前端流，等待用户提交答案。
+struct ChannelQuestioner {
+    /// 当前回合 SSE 事件出口（提问/已答事件直接送入流）。
+    tx: mpsc::UnboundedSender<Result<Event, Infallible>>,
+    pending: Arc<Mutex<HashMap<String, tokio::sync::oneshot::Sender<QuestionAnswer>>>>,
+    pending_sessions: Arc<Mutex<HashMap<String, String>>>,
+    session_id: String,
+    abort: Arc<AtomicBool>,
+}
+
+#[async_trait::async_trait]
+impl Questioner for ChannelQuestioner {
+    async fn ask(&self, question: &UserQuestion) -> Option<QuestionAnswer> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        if let Ok(mut pending) = self.pending.lock() {
+            pending.insert(question.question_id.clone(), tx);
+        }
+        if let Ok(mut sessions) = self.pending_sessions.lock() {
+            sessions.insert(question.question_id.clone(), self.session_id.clone());
+        }
+        // 先注册等待再推送事件：用户抢在事件送达前提交也不会丢答案。
+        let _ = self.tx.send(to_event(SseEvent::UserQuestion {
+            question_id: question.question_id.clone(),
+            question: question.question.clone(),
+            options: question.options.clone(),
+        }));
+        let mut rx = rx;
+        let deadline = tokio::time::sleep(std::time::Duration::from_secs(question_timeout_secs()));
+        tokio::pin!(deadline);
+        let mut answer = None;
+        let mut source = "timeout";
+        loop {
+            tokio::select! {
+                result = &mut rx => {
+                    if let Ok(received) = result {
+                        source = "user";
+                        answer = Some(received);
+                    }
+                    break;
+                }
+                _ = &mut deadline => break,
+                _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {
+                    if self.abort.load(Ordering::Relaxed) {
+                        source = "aborted";
+                        break;
+                    }
+                }
+            }
+        }
+        if let Ok(mut pending) = self.pending.lock() {
+            pending.remove(&question.question_id);
+        }
+        if let Ok(mut sessions) = self.pending_sessions.lock() {
+            sessions.remove(&question.question_id);
+        }
+        // 终态回执：前端据此关闭提问卡（超时/中止时显示对应提示）。
+        let _ = self.tx.send(to_event(SseEvent::UserAnswered {
+            question_id: question.question_id.clone(),
+            answer: answer
+                .as_ref()
+                .map(|value| value.answer.clone())
+                .unwrap_or_default(),
+            source: source.to_string(),
+        }));
+        answer
+    }
+}
+
 fn to_sse(event: &owo_agent_core::TurnEvent) -> Option<SseEvent> {
     match event {
         owo_agent_core::TurnEvent::ModelCall => Some(SseEvent::Progress {
             message: "模型调用".to_string(),
         }),
         owo_agent_core::TurnEvent::TokenDelta { delta } => Some(SseEvent::TokenDelta {
+            delta: delta.clone(),
+        }),
+        owo_agent_core::TurnEvent::ReasoningDelta { delta } => Some(SseEvent::ReasoningDelta {
             delta: delta.clone(),
         }),
         owo_agent_core::TurnEvent::Compaction { summary } => Some(SseEvent::Compaction {
@@ -3740,23 +4820,28 @@ fn to_sse(event: &owo_agent_core::TurnEvent) -> Option<SseEvent> {
                 reason: request.reason.clone(),
             })
         }
-        owo_agent_core::TurnEvent::ToolStart { id, tool } => Some(SseEvent::ToolUse {
+        owo_agent_core::TurnEvent::ToolStart { id, tool, args } => Some(SseEvent::ToolUse {
             id: id.clone(),
             tool: tool.clone(),
-            args: Value::Null,
+            args: args.clone(),
         }),
         owo_agent_core::TurnEvent::ToolResult {
             id,
             tool,
             ok,
             error,
+            preview,
         } => Some(SseEvent::ToolResult {
             id: id.clone(),
             tool: tool.clone(),
             ok: *ok,
             error: error.clone(),
+            preview: preview.clone(),
         }),
         owo_agent_core::TurnEvent::Final { text } => Some(SseEvent::Final { text: text.clone() }),
+        owo_agent_core::TurnEvent::PlanUpdate { steps } => Some(SseEvent::PlanUpdate {
+            steps: serde_json::to_value(steps).unwrap_or_else(|_| Value::Array(Vec::new())),
+        }),
     }
 }
 
@@ -3931,6 +5016,10 @@ async fn session_context(
         "session_id": id,
         "messages": messages.len(),
         "estimated_tokens": estimated,
+        // P1-1：计数口径与模型窗口（排查估算偏差、核对预算推导）。
+        "tokenizer": owo_agent_core::tokenizer_name(),
+        "tokenizer_estimated": true,
+        "model_context_window": config.model_context_window,
         "token_budget": config.token_budget,
         "compaction_enabled": config.compaction_enabled,
         "over_budget": estimated > config.token_budget,
@@ -4124,7 +5213,8 @@ async fn subagent_run(
         .model
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| {
-            std::env::var("OPENAI_MODEL").unwrap_or_else(|_| "deepseek-v4-flash".to_string())
+            std::env::var("OPENAI_MODEL")
+                .unwrap_or_else(|_| owo_agent_core::gateway::DEFAULT_MODEL.to_string())
         });
     let agent = Arc::clone(&state.agent);
     let text = agent
@@ -4169,9 +5259,15 @@ async fn mcp_list(State(state): State<Arc<AppState>>) -> Json<Value> {
             merged.push(server);
         }
     }
+    // 已连接的服务器：插件 manifest 声明的 stdio 服务器只在启动时并入内存
+    // （`merge_plugin_mcp` → `connect_mcp_clients`），不落盘，所以单看配置会显示为空。
+    // 这里如实带上运行时注册表的名字，前端才能区分「未配置」与「已连接但非配置来源」。
+    let connected = state.agent.mcp_clients().names();
     Json(json!({
         "count": merged.len(),
         "servers": merged,
+        "connected": connected,
+        "connected_count": connected.len(),
     }))
 }
 
@@ -4871,9 +5967,16 @@ fn to_event(sse: SseEvent) -> Result<Event, Infallible> {
         SseEvent::ToolUse { .. } => "tool_use",
         SseEvent::ToolResult { .. } => "tool_result",
         SseEvent::PermissionRequest { .. } => "permission_request",
+        SseEvent::PermissionResolved { .. } => "permission_resolved",
         SseEvent::Final { .. } => "final",
+        SseEvent::TurnFailed { .. } => "turn_failed",
+        SseEvent::TurnStats { .. } => "turn_stats",
         SseEvent::TokenDelta { .. } => "token_delta",
+        SseEvent::ReasoningDelta { .. } => "reasoning_delta",
         SseEvent::Compaction { .. } => "compaction",
+        SseEvent::UserQuestion { .. } => "user_question",
+        SseEvent::UserAnswered { .. } => "user_answered",
+        SseEvent::PlanUpdate { .. } => "plan_update",
     };
     // R10：SSE 事件统一携带协议版本 v（见 protocol::SSE_PROTOCOL_VERSION）。
     let mut payload = serde_json::to_value(&sse).unwrap_or_else(|_| json!({}));
@@ -4902,6 +6005,8 @@ const DEPRECATED_ROUTES: &[(&str, &str, &str, &str)] = &[];
 /// - 2026-08-17（R10）：SSE 事件 data 统一携带 `v` 字段（v=1；旧客户端帧缺 v 视为 v=0）。
 /// - 2026-08-17（R10）：新增 /schemas/{kind}/{version} 静态 JSON Schema 版本化发布。
 /// - 2026-08-17（R10）：错误响应统一为 {error:{code,message,retry_after_ms,domain,reason,retryable}}。
+/// - 2026-09-30（B1-5）：新增 SSE 事件 `permission_resolved`（审批终态回执，
+///   与 `user_answered` 对称；非破坏性新增，旧客户端忽略未知事件）。
 #[allow(dead_code)]
 const CONTRACT_RFC_LOG: &str = "2026-08-17 R10: SSE v 字段 / schemas 发布 / 统一错误码";
 

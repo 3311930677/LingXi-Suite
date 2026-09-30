@@ -2,6 +2,12 @@
 
 use owo_agent_core::cloud_exec::{CloudExecutor, CloudTaskSpec, DiffKind, LocalSimExecutor};
 use std::path::PathBuf;
+use std::sync::Mutex;
+
+/// OWO_CLOUD_TOKEN / OWO_CLOUD_API_KEY 是进程级环境变量；同一测试二进制并行运行时
+/// 互相覆盖会让 `cloud_token_from_env` 的 fallback 断言随机失败（2026-09-28 全量门禁实测命中）。
+/// 所有读写这两个变量的测试必须持有此锁。
+static CLOUD_ENV_LOCK: Mutex<()> = Mutex::new(());
 
 fn scratch(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("owo-cloud-{name}-{}", std::process::id()));
@@ -377,7 +383,10 @@ async fn v02_end_to_end_mock_remote_apply_revert() {
 }
 
 #[tokio::test]
+// 测试需跨 await 持有进程级 env 锁：串行化环境变量修改，避免并行测试互相污染。
+#[allow(clippy::await_holding_lock)]
 async fn v02_credentials_never_persist() {
+    let _env_guard = CLOUD_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     // 用 fallback 变量（OWO_CLOUD_API_KEY）避免与 http 契约测试并行争用 OWO_CLOUD_TOKEN。
     std::env::set_var("OWO_CLOUD_API_KEY", "super-secret-token-xyz");
     let queue_dir = scratch("q-cred");
@@ -609,7 +618,10 @@ async fn v02_http_transport_unreachable_clear_error() {
 }
 
 #[tokio::test]
+// 测试需跨 await 持有进程级 env 锁：串行化环境变量修改，避免并行测试互相污染。
+#[allow(clippy::await_holding_lock)]
 async fn v02_http_transport_contract_against_inline_server() {
+    let _env_guard = CLOUD_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     // 极简 HTTP 远端：验证 submit/status/result/cancel 契约与 Authorization 头透传。
     std::env::set_var("OWO_CLOUD_TOKEN", "tok-abc");
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

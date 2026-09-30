@@ -20,10 +20,12 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
+mod markdown;
 mod tui;
 
-/// 千问 Token Plan 的默认通用文本/推理模型；可在工作台设置中覆盖。
-const DEFAULT_MODEL: &str = "qwen3.8-max";
+/// 未配置时的默认模型：与网关/服务端共用同一常量（此前 CLI 用 `qwen3.8-max`，与网关的
+/// `deepseek-v4-flash` 不一致，同一份代码会出现「CLI 说的默认」和「实际请求的模型」不同）。
+const DEFAULT_MODEL: &str = owo_agent_core::gateway::DEFAULT_MODEL;
 
 const AGENTS_TEMPLATE: &str = r#"# AGENTS.md
 
@@ -96,6 +98,8 @@ enum Commands {
     Turn(TurnArgs),
     /// 启动本地 HTTP API 服务
     Serve(ServeArgs),
+    /// 启动 OwO 输入法 Agent IPC 服务（命名管道 + HTTP 双面，仅 Windows）
+    ServeIme(ServeImeArgs),
     /// 进入交互式终端（默认命令）
     Repl(ReplArgs),
     /// 进入全屏 TUI（OpenCode 风格）
@@ -254,13 +258,20 @@ enum PluginAction {
 struct TurnArgs {
     #[arg(long, default_value = ".")]
     workspace: PathBuf,
+    /// 任务提示词；传 `-` 或省略（stdin 非终端）时从 stdin 读取（B4）
     #[arg(long)]
-    prompt: String,
+    prompt: Option<String>,
     #[arg(long)]
     model: Option<String>,
     /// 自动允许所有审批（仅测试用）
     #[arg(long)]
     no_approval: bool,
+    /// 只输出最终文本（脚本/管道消费；不回显状态行与统计）（B4）
+    #[arg(long)]
+    print: bool,
+    /// 输出结构化 JSON：`{final_text, steps, duration_ms, usage, diffs, session_id, trace}`（B4）
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Args)]
@@ -269,6 +280,25 @@ struct ServeArgs {
     port: u16,
     #[arg(long, default_value = ".")]
     workspace: PathBuf,
+}
+
+#[derive(Args)]
+struct ServeImeArgs {
+    /// HTTP 服务端口（桌宠 / Web 工作台连接同一进程）
+    #[arg(long, default_value_t = 4096)]
+    port: u16,
+    /// 沙箱工作区（会话 workspace 必须与之一致）
+    #[arg(long, default_value = ".")]
+    workspace: PathBuf,
+    /// 命名管道端点（OwO 连接器配置需一致）
+    #[arg(long, default_value = r"\\.\pipe\OwO.Agent.External.v1")]
+    pipe: String,
+    /// 单次管道操作超时（毫秒，钳位 500–30000）
+    #[arg(long, default_value_t = 10000)]
+    timeout_ms: u64,
+    /// 数据目录（与 serve 共用互斥锁，不可同时运行）
+    #[arg(long)]
+    data_dir: Option<PathBuf>,
 }
 
 #[derive(Args)]
@@ -393,6 +423,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }))?,
         Some(Commands::Turn(args)) => run_async(run_turn(args))?,
         Some(Commands::Serve(args)) => run_async(run_serve(args))?,
+        Some(Commands::ServeIme(args)) => run_async(run_serve_ime(args))?,
         Some(Commands::Repl(args)) => run_async(Repl::run(args))?,
         Some(Commands::Tui(args)) => tui::run(args)?,
         Some(Commands::Init(args)) => run_init(args)?,
@@ -883,6 +914,28 @@ where
         .block_on(future)
 }
 
+/// B4：解析一次性任务的提示词来源：`--prompt X` > `--prompt -`（stdin）> stdin 管道。
+fn resolve_turn_prompt(option: Option<String>) -> Result<String, Box<dyn std::error::Error>> {
+    use std::io::Read;
+    let from_stdin = || -> Result<String, Box<dyn std::error::Error>> {
+        let mut buffer = String::new();
+        std::io::stdin().read_to_string(&mut buffer)?;
+        Ok(buffer)
+    };
+    let prompt = match option.as_deref().map(str::trim) {
+        Some("-") => from_stdin()?,
+        Some(text) if !text.is_empty() => text.to_string(),
+        Some(_) => String::new(),
+        // 未显式传入且 stdin 是管道/重定向：整体读入。
+        None if !std::io::stdin().is_terminal() => from_stdin()?,
+        None => String::new(),
+    };
+    if prompt.trim().is_empty() {
+        return Err("提示词为空：用 --prompt 传入，或从 stdin 喂入（--prompt -）".into());
+    }
+    Ok(prompt)
+}
+
 fn resolve_model(option: Option<String>, settings_model: Option<&str>) -> String {
     option
         .or_else(|| std::env::var("OPENAI_MODEL").ok())
@@ -896,7 +949,9 @@ fn build_agent(
     read_only: bool,
 ) -> Result<Agent, Box<dyn std::error::Error>> {
     let root = ensure_data_root(None, workspace);
-    let settings = Settings::load(workspace);
+    let settings =
+        Settings::load_encrypted(workspace).unwrap_or_else(|_| Settings::load(workspace));
+    settings.apply_provider_override();
     let mut skills = SkillRegistry::discover(workspace, &root);
     apply_disabled_skills(&mut skills, &settings);
     build_agent_with_mcp(
@@ -906,6 +961,7 @@ fn build_agent(
         &[],
         &skills,
         &settings.deny_commands,
+        &settings.permissions.rules,
     )
 }
 
@@ -916,13 +972,12 @@ fn build_agent_with_mcp(
     mcp_clients: &[(String, Arc<tokio::sync::Mutex<McpClient>>)],
     skills: &SkillRegistry,
     deny_commands: &[String],
+    permission_rules: &[owo_agent_core::PermissionRule],
 ) -> Result<Agent, Box<dyn std::error::Error>> {
-    let mut config = OpenAiCompatibleConfig::from_env()?;
-    config.model = model.to_string();
-    // R9：模型网关韧性（重试/退避/熔断/failover 强→次选云→本地）。
-    let provider = Arc::new(owo_agent_core::gateway::ResilientProvider::from_config(
-        config,
-    )?);
+    // 主 provider 延迟解析：未配置时服务照样能起来（设置页可访问、可填写），
+    // 设置页保存后下一个回合自动用上新端点/密钥，无需重启。
+    let provider: Arc<dyn ModelProvider> =
+        Arc::new(owo_agent_core::gateway::ResilientProvider::from_deferred());
     let mut policy = if read_only {
         Policy::read_only(workspace.to_path_buf())
     } else {
@@ -931,7 +986,17 @@ fn build_agent_with_mcp(
     for fragment in deny_commands {
         policy.add_deny_command(fragment.clone());
     }
+    // A6-1：启动时灌入 settings 里「总是允许」的规则（与 server 同口径）——
+    // 此前 CLI 只写不读，用户选了「总是允许」重启后并不生效。
+    if !permission_rules.is_empty() {
+        policy.replace_rules(permission_rules.to_vec());
+    }
     let mut config = AgentConfig::default();
+    // P1-1：按模型上下文窗口推导 token 预算（窗口 × 0.75）；OWO_TOKEN_BUDGET 显式覆盖。
+    if let Some(window) = owo_agent_core::context_window_for_model(model) {
+        config.model_context_window = Some(window);
+        config.token_budget = owo_agent_core::budget_from_window(window);
+    }
     if let Ok(value) = std::env::var("OWO_TOKEN_BUDGET") {
         if let Ok(budget) = value.parse() {
             config.token_budget = budget;
@@ -1056,11 +1121,21 @@ fn display_path(path: &std::path::Path) -> String {
 
 async fn run_turn(args: TurnArgs) -> Result<(), Box<dyn std::error::Error>> {
     let workspace = args.workspace.canonicalize()?;
-    let settings = Settings::load(&workspace);
+    let settings =
+        Settings::load_encrypted(&workspace).unwrap_or_else(|_| Settings::load(&workspace));
     apply_egress_setting(&settings);
     settings.apply_usage_env();
+    settings.apply_reasoning_env();
+    settings.apply_provider_override();
+    let explicit_model = args.model.is_some();
     let model = resolve_model(args.model, settings.model.as_deref());
-    let agent = build_agent(&workspace, &model, false)?;
+    // `--model` 必须写进接入配置才会进请求体（否则只存进会话记录，wire 上仍是 env/settings 的值）。
+    if explicit_model {
+        owo_agent_core::gateway::set_model_override(model.clone());
+    }
+    // B4：提示词来源——`--prompt X` / `--prompt -`（stdin）/ stdin 管道。
+    let prompt = resolve_turn_prompt(args.prompt.clone())?;
+    let agent = Arc::new(build_agent(&workspace, &model, false)?);
     let mut session = Session::new(workspace.clone(), model, None);
     let abort = Arc::new(AtomicBool::new(false));
     let abort_flag = Arc::clone(&abort);
@@ -1075,41 +1150,83 @@ async fn run_turn(args: TurnArgs) -> Result<(), Box<dyn std::error::Error>> {
     } else {
         Arc::new(ConsoleApprover {
             stdin: SharedStdin::new(),
+            agent: Arc::clone(&agent),
+            workspace: workspace.clone(),
         })
     };
 
-    let mut printer = EventPrinter::new();
+    // B4：`--print` / `--json` 时静默回显，只由下方输出最终结果。
+    let mut printer = if args.print || args.json {
+        EventPrinter::quiet()
+    } else {
+        EventPrinter::new()
+    };
     let mut on_event = |event: &TurnEvent| printer.print(event);
     let outcome = agent
         .run_turn(
             &mut session,
-            &args.prompt,
+            &prompt,
             approver.as_ref(),
             &abort,
             &mut on_event,
         )
         .await?;
-    println!(
-        "\n[完成] 工具步数：{}，最终文本：{}",
-        outcome.steps,
-        outcome.final_text.is_some()
-    );
 
-    let diffs = session.diff();
-    if !diffs.is_empty() {
-        println!("[diff] 本次会话改动文件：");
-        for diff in diffs {
-            println!("  - {}", diff.path);
-        }
-    }
-    let audit = agent.audit_log();
-    if let Ok(audit) = audit.lock() {
-        println!("[审计] 记录 {} 条", audit.entries.len());
-    }
     let root = ensure_data_root(None, &workspace);
     let trace = TraceRecord::from_outcome(&session, &outcome);
-    if let Ok(path) = save_trace(&root.join("traces"), &trace) {
-        println!("[trace] {}", display_path(&path));
+    let trace_path = save_trace(&root.join("traces"), &trace)
+        .ok()
+        .map(|path| display_path(&path));
+
+    if args.json {
+        // B4：结构化输出（脚本/CI 消费）。
+        let usage = &outcome.usage;
+        let payload = serde_json::json!({
+            "final_text": outcome.final_text.clone().unwrap_or_default(),
+            "steps": outcome.steps,
+            "duration_ms": outcome.duration_ms,
+            "usage": {
+                "prompt_tokens": usage.prompt_tokens,
+                "completion_tokens": usage.completion_tokens,
+                "total_tokens": usage.total_tokens,
+                "cost_usd": turn_cost(&outcome),
+            },
+            "diffs": session
+                .diff()
+                .iter()
+                .map(|diff| diff.path.clone())
+                .collect::<Vec<_>>(),
+            "session_id": session.id,
+            "trace": trace_path,
+        });
+        println!("{}", serde_json::to_string_pretty(&payload)?);
+    } else if args.print {
+        // B4：只输出最终文本（干净管道输出）。
+        if let Some(text) = &outcome.final_text {
+            println!("{text}");
+        }
+    } else {
+        println!(
+            "\n[完成] 工具步数：{}，最终文本：{}",
+            outcome.steps,
+            outcome.final_text.is_some()
+        );
+        // B2：回合统计（耗时 / token / 成本）。
+        println!("[统计] {}", turn_stats(&outcome));
+        let diffs = session.diff();
+        if !diffs.is_empty() {
+            println!("[diff] 本次会话改动文件：");
+            for diff in diffs {
+                println!("  - {}", diff.path);
+            }
+        }
+        let audit = agent.audit_log();
+        if let Ok(audit) = audit.lock() {
+            println!("[审计] 记录 {} 条", audit.entries.len());
+        }
+        if let Some(path) = &trace_path {
+            println!("[trace] {path}");
+        }
     }
     let audit_entries = agent
         .audit_log()
@@ -1122,37 +1239,59 @@ async fn run_turn(args: TurnArgs) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-async fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
-    let workspace = args.workspace.canonicalize()?;
-    let settings = Settings::load(&workspace);
+/// 构建完整服务状态（settings → agent → AppState → pid 互斥 → 后台任务）。
+///
+/// `serve` 与 `serve-ime` 共用；同一 data_root 下两个入口互斥（PidFile 双开检测）。
+/// 返回的 `PidFile` 必须由调用方持有到进程退出（Drop 时清理 pid 文件）。
+async fn build_server_state(
+    workspace: &std::path::Path,
+    data_dir: Option<PathBuf>,
+) -> Result<
+    (
+        Arc<owo_agent_server::AppState>,
+        owo_agent_server::shutdown::PidFile,
+    ),
+    Box<dyn std::error::Error>,
+> {
+    // 加密信封优先：端点在明文，密钥只在 settings.json.owo-crypt。
+    let settings =
+        Settings::load_encrypted(workspace).unwrap_or_else(|_| Settings::load(workspace));
     apply_egress_setting(&settings);
     settings.apply_usage_env();
+    settings.apply_reasoning_env();
+    // 必须先于 build_agent_with_mcp（其内部读 provider 配置）注册覆盖。
+    settings.apply_provider_override();
     let model = resolve_model(None, settings.model.as_deref());
-    let root = ensure_data_root(None, &workspace);
+    let root = ensure_data_root(data_dir, workspace);
     let plugin_state = owo_agent_core::PluginStateStore::new(Some(root.join("plugin_state.json")));
-    let plugins =
-        owo_agent_core::plugin::discover_enabled_plugins(&workspace, &root, &plugin_state);
+    let plugins = owo_agent_core::plugin::discover_enabled_plugins(workspace, &root, &plugin_state);
     let mut mcp_configs = load_mcp_configs(&root);
     merge_plugin_mcp(&plugins, &mut mcp_configs);
     let mcp_clients = connect_mcp_clients(&mcp_configs).await;
     let _ = install_builtin_packages(&builtin_skills_root(), &root);
-    let mut skills = SkillRegistry::discover(&workspace, &root);
+    let mut skills = SkillRegistry::discover(workspace, &root);
     apply_disabled_skills(&mut skills, &settings);
     let agent = build_agent_with_mcp(
-        &workspace,
+        workspace,
         &model,
         settings.read_only,
         &mcp_clients,
         &skills,
         &settings.deny_commands,
+        // 权限规则（审批「记住」持久化的）灌入策略：重启后「总是允许」仍生效。
+        &settings.permissions.rules,
     )?;
+    // A2-1：hooks 配置灌入（settings.json 的 `hooks` 数组；exit 2 = 阻断）。
+    agent.set_hooks(owo_agent_core::hooks::HookManager::from_configs(
+        &settings.hooks,
+    ));
     let store = SqliteSessionStore::open(&root.join("index.db"))?;
     let state = Arc::new(owo_agent_server::AppState::new(
         agent,
         store,
         root.join("traces"),
         root.clone(),
-        workspace.clone(),
+        workspace.to_path_buf(),
     ));
     // R8：强杀恢复——陈旧 pid 文件清理；检测到存活实例则显式拒绝双开。
     if let Some(recovery) = owo_agent_server::shutdown::recover_force_kill(&root)? {
@@ -1161,7 +1300,7 @@ async fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
             recovery.stale_pid
         );
     }
-    let _pid_file = owo_agent_server::shutdown::PidFile::create(&root)?;
+    let pid_file = owo_agent_server::shutdown::PidFile::create(&root)?;
     // R8：优雅关闭接线——停止接收 → 完成在途 → flush 审计 → 清理 pid → 退出。
     let shutdown_state = Arc::clone(&state);
     let shutdown_root = root.clone();
@@ -1198,6 +1337,12 @@ async fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
     tokio::spawn(async move {
         owo_agent_server::start_memory_observer(memory_state).await;
     });
+    Ok((state, pid_file))
+}
+
+async fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let workspace = args.workspace.canonicalize()?;
+    let (state, _pid_file) = build_server_state(&workspace, None).await?;
     let app = owo_agent_server::build_router(Arc::clone(&state));
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], args.port));
     let listener = tokio::net::TcpListener::bind(addr).await?;
@@ -1210,6 +1355,85 @@ async fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
     }
     result?;
     Ok(())
+}
+
+/// `owo-agent serve-ime`：OwO 输入法 Agent IPC 服务（命名管道 + HTTP 双面，仅 Windows）。
+///
+/// - 管道面：供 OwO 输入法 Agent IPC 连接器调用（协议 v3）；
+/// - HTTP 面：桌宠 / Web 工作台连接同一进程（会话与审批状态共享）；
+/// - 与 `serve` 共用数据目录互斥锁（不可同时运行）。
+async fn run_serve_ime(args: ServeImeArgs) -> Result<(), Box<dyn std::error::Error>> {
+    #[cfg(not(windows))]
+    {
+        let _ = args;
+        Err("serve-ime 仅支持 Windows（OwO 输入法为 Windows TSF）".into())
+    }
+    #[cfg(windows)]
+    {
+        let workspace = args.workspace.canonicalize()?;
+        let timeout_ms = owo_agent_ime::clamp_timeout_ms(args.timeout_ms);
+        let (state, _pid_file) = build_server_state(&workspace, args.data_dir.clone()).await?;
+
+        // HTTP 面（桌宠 / Web 工作台）。
+        let app = owo_agent_server::build_router(Arc::clone(&state));
+        let addr = std::net::SocketAddr::from(([127, 0, 0, 1], args.port));
+        let listener = tokio::net::TcpListener::bind(addr).await?;
+        tracing::info!(
+            "serve-ime HTTP 监听 http://{addr}（工作区 {}）",
+            workspace.display()
+        );
+
+        // 管道面（OwO 输入法）。
+        let ime_state = Arc::new(owo_agent_ime::ImeState::new(
+            owo_agent_ime::DEFAULT_SESSION_TTL,
+        ));
+        let client = Arc::new(owo_agent_ime::OwoHttpClient::new(format!(
+            "http://127.0.0.1:{}",
+            args.port
+        )));
+        let web_url = format!("http://127.0.0.1:{}/", args.port);
+        let bridge = owo_agent_ime::ImeBridge::new(
+            ime_state,
+            client,
+            workspace.to_string_lossy().to_string(),
+            web_url,
+        );
+        let handler: Arc<dyn owo_agent_ime::FrameHandler> = bridge;
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let pipe_name = args.pipe.clone();
+        let pipe_task = tokio::spawn(async move {
+            match owo_agent_ime::run_pipe_server(
+                &pipe_name,
+                std::time::Duration::from_millis(timeout_ms),
+                handler,
+                shutdown_rx,
+            )
+            .await
+            {
+                Ok(()) => tracing::info!("IME 管道服务正常停止"),
+                Err(error) => tracing::error!("IME 管道服务异常退出：{error}"),
+            }
+        });
+        tracing::info!(
+            "IME 管道监听：{}（单次操作超时 {timeout_ms}ms，ACL 限当前用户）",
+            args.pipe
+        );
+
+        tokio::select! {
+            result = axum::serve(listener, app) => {
+                let _ = shutdown_tx.send(true);
+                let shutdown_errors = state.agent.shutdown_all_mcp().await;
+                for (name, error) in shutdown_errors {
+                    tracing::warn!("MCP 服务器 {name} 关闭失败：{error}");
+                }
+                result?;
+            }
+            _ = pipe_task => {
+                tracing::error!("IME 管道服务已停止，进程退出");
+            }
+        }
+        Ok(())
+    }
 }
 
 fn merge_plugin_mcp(
@@ -1265,41 +1489,255 @@ fn print_event(event: &TurnEvent) {
             }
         }
         TurnEvent::TokenDelta { .. } => {}
+        // 思考流：CLI 单行事件打印不展示（Web 端有独立思考块）。
+        TurnEvent::ReasoningDelta { .. } => {}
         TurnEvent::Compaction { summary } => {
             println!("  {}（上下文已压缩：{}）", "✦".yellow(), summary);
+        }
+        TurnEvent::PlanUpdate { steps } => {
+            let done = steps
+                .iter()
+                .filter(|step| step.status == "completed")
+                .count();
+            println!(
+                "  {} 计划更新：{}/{} 步完成",
+                "≡".yellow(),
+                done,
+                steps.len()
+            );
         }
         TurnEvent::Final { .. } => {}
     }
 }
 
-/// 事件打印器：把流式增量逐字输出，Final 只收尾不重复打印。
+/// 事件打印器：把流式增量逐段输出（B2：经 Markdown 渲染器按行着色），
+/// Final 只收尾不重复打印。
 struct EventPrinter {
     streamed: bool,
+    markdown: markdown::MarkdownStream,
+    /// B4：静默模式（`--print` / `--json`）——不回显流式正文与状态行，
+    /// 只由调用方输出最终文本或 JSON。
+    quiet: bool,
 }
 
 impl EventPrinter {
     fn new() -> Self {
-        Self { streamed: false }
+        Self {
+            streamed: false,
+            markdown: markdown::MarkdownStream::new(),
+            quiet: false,
+        }
+    }
+
+    fn quiet() -> Self {
+        Self {
+            quiet: true,
+            ..Self::new()
+        }
     }
 
     fn print(&mut self, event: &TurnEvent) {
+        if self.quiet {
+            return;
+        }
         match event {
             TurnEvent::TokenDelta { delta } => {
                 use std::io::Write;
                 self.streamed = true;
-                print!("{delta}");
+                print!("{}", self.markdown.push(delta));
                 let _ = std::io::stdout().flush();
             }
             TurnEvent::Final { text } => {
                 if self.streamed {
+                    let tail = self.markdown.finish();
+                    print!("{tail}");
                     println!();
                     self.streamed = false;
                 } else {
-                    println!("\n{}\n{text}", "── 结果 ──".bold());
+                    // 非流式（模型一次性返回）：整体渲染后打印。
+                    let mut stream = markdown::MarkdownStream::new();
+                    let rendered = format!("{}{}", stream.push(text), stream.finish());
+                    println!("\n{}\n{rendered}\n", "── 结果 ──".bold());
                 }
             }
             other => print_event(other),
         }
+    }
+}
+
+/// B2：回合统计（耗时 / token / 成本）——`⏱ 12.3s · ↑1.2k ↓0.8k tokens · $0.004`。
+/// 未配置单价环境变量（`OWO_MODEL_INPUT_PRICE_PER_MTOK` / `..._OUTPUT_...`）时省略成本。
+pub(crate) fn turn_stats(outcome: &owo_agent_core::TurnOutcome) -> String {
+    let usage = &outcome.usage;
+    let cost = turn_cost(outcome);
+    let mut parts = vec![
+        format!("⏱ {:.1}s", outcome.duration_ms as f64 / 1000.0),
+        format!(
+            "↑{} ↓{} tokens",
+            compact_count(usage.prompt_tokens),
+            compact_count(usage.completion_tokens)
+        ),
+    ];
+    if cost > 0.0 {
+        parts.push(format!("${cost:.4}"));
+    }
+    parts.join(" · ")
+}
+
+/// B3：REPL 斜杠命令清单（Tab 补全用）。
+pub(crate) const REPL_COMMANDS: &[&str] = &[
+    "/help",
+    "/new",
+    "/sessions",
+    "/resume",
+    "/model",
+    "/diff",
+    "/undo",
+    "/revert",
+    "/status",
+    "/permissions",
+    "/audit",
+    "/mcp",
+    "/skills",
+    "/whitelist",
+    "/perception",
+    "/learn",
+    "/proactive",
+    "/plan",
+    "/build",
+    "/init",
+    "/traces",
+    "/trace",
+    "/share",
+    "/fork",
+    "/rewind",
+    "/redo",
+    "/tree",
+    "/abort",
+    "/clear",
+    "/exit",
+    "/quit",
+];
+
+/// B3：补全候选——`/命令` 前缀补全，或文件/目录路径补全（`@` 前缀保留）。
+/// REPL（rustyline Completer）与 TUI（Tab）共用同一份实现。
+pub(crate) fn completion_candidates(token: &str) -> Vec<String> {
+    if token.starts_with('/') {
+        let mut items: Vec<String> = REPL_COMMANDS
+            .iter()
+            .filter(|command| command.starts_with(token))
+            .map(|command| (*command).to_string())
+            .collect();
+        items.sort();
+        return items;
+    }
+    let (prefix, path) = match token.strip_prefix('@') {
+        Some(rest) => ("@", rest),
+        None => ("", token),
+    };
+    if path.is_empty() {
+        return Vec::new();
+    }
+    let (dir, base) = match path.rfind(['/', '\\']) {
+        Some(index) => (&path[..=index], &path[index + 1..]),
+        None => ("", path),
+    };
+    let read_dir = if dir.is_empty() {
+        std::path::PathBuf::from(".")
+    } else {
+        std::path::PathBuf::from(dir)
+    };
+    let Ok(entries) = std::fs::read_dir(&read_dir) else {
+        return Vec::new();
+    };
+    let mut items: Vec<String> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if !name.starts_with(base) {
+                return None;
+            }
+            let mut candidate = format!("{prefix}{dir}{name}");
+            if entry.path().is_dir() {
+                candidate.push('/');
+            }
+            Some(candidate)
+        })
+        .collect();
+    items.sort();
+    items
+}
+
+/// B3：最长公共前缀（多候选时的补全目标）。
+pub(crate) fn longest_common_prefix(items: &[String]) -> String {
+    let Some(first) = items.first() else {
+        return String::new();
+    };
+    let mut prefix = first.clone();
+    for candidate in &items[1..] {
+        let mut length = 0;
+        for (left, right) in prefix.chars().zip(candidate.chars()) {
+            if left != right {
+                break;
+            }
+            length += left.len_utf8();
+        }
+        prefix.truncate(length);
+    }
+    prefix
+}
+
+/// B3：REPL 补全器（Tab）——斜杠命令与文件路径；其余 trait 用默认实现。
+struct ReplHelper;
+
+impl rustyline::completion::Completer for ReplHelper {
+    type Candidate = String;
+
+    fn complete(
+        &self,
+        line: &str,
+        pos: usize,
+        _context: &rustyline::Context<'_>,
+    ) -> rustyline::Result<(usize, Vec<String>)> {
+        let head = &line[..pos.min(line.len())];
+        let start = head
+            .rfind(char::is_whitespace)
+            .map(|index| index + 1)
+            .unwrap_or(0);
+        let token = &head[start..];
+        Ok((start, completion_candidates(token)))
+    }
+}
+
+impl rustyline::highlight::Highlighter for ReplHelper {}
+impl rustyline::hint::Hinter for ReplHelper {
+    type Hint = String;
+}
+impl rustyline::validate::Validator for ReplHelper {}
+// rustyline 14 无 blanket impl：四个子 trait 齐备后需显式标注 Helper。
+impl rustyline::Helper for ReplHelper {}
+
+/// B4/B2：回合成本估算（单价由 `OWO_MODEL_INPUT_PRICE_PER_MTOK` /
+/// `OWO_MODEL_OUTPUT_PRICE_PER_MTOK` 提供；未配置则为 0）。
+pub(crate) fn turn_cost(outcome: &owo_agent_core::TurnOutcome) -> f64 {
+    let price = |name: &str| {
+        std::env::var(name)
+            .ok()
+            .and_then(|value| value.parse::<f64>().ok())
+            .unwrap_or(0.0)
+    };
+    outcome.usage.cost_estimate_usd(
+        price("OWO_MODEL_INPUT_PRICE_PER_MTOK"),
+        price("OWO_MODEL_OUTPUT_PRICE_PER_MTOK"),
+    )
+}
+
+/// 大数缩写：1234 → 1.2k。
+fn compact_count(count: u64) -> String {
+    if count >= 1_000 {
+        format!("{:.1}k", count as f64 / 1000.0)
+    } else {
+        count.to_string()
     }
 }
 
@@ -1332,7 +1770,13 @@ impl Repl {
         let settings = Settings::load(&workspace);
         apply_egress_setting(&settings);
         settings.apply_usage_env();
+        settings.apply_reasoning_env();
+        settings.apply_provider_override();
+        let explicit_model = args.model.is_some();
         let model = resolve_model(args.model, settings.model.as_deref());
+        if explicit_model {
+            owo_agent_core::gateway::set_model_override(model.clone());
+        }
         let read_only = args.agent == "plan" || settings.read_only;
         let root = ensure_data_root(args.data_dir, &workspace);
         let store = SqliteSessionStore::open(&root.join("index.db"))?;
@@ -1368,6 +1812,7 @@ impl Repl {
             &mcp_clients,
             &skills,
             &settings.deny_commands,
+            &settings.permissions.rules,
         )?);
         let mut repl = Repl {
             workspace,
@@ -1416,7 +1861,10 @@ impl Repl {
         &mut self,
         history_path: &std::path::Path,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let mut rl = rustyline::DefaultEditor::new()?;
+        // B3：带补全器的编辑器（Tab 补全 `/命令` 与文件路径）。
+        let mut rl =
+            rustyline::Editor::<ReplHelper, rustyline::history::DefaultHistory>::new()?;
+        rl.set_helper(Some(ReplHelper));
         if let Ok(content) = std::fs::read_to_string(history_path) {
             for line in content.lines() {
                 let _ = rl.add_history_entry(line);
@@ -1430,6 +1878,19 @@ impl Repl {
             };
             match rl.readline(&prompt) {
                 Ok(line) => {
+                    // B3：行尾 `\` 续行（多行输入——粘贴代码块/多段需求时不必逐行写）。
+                    let mut line = line.trim_end().to_string();
+                    while line.ends_with('\\') {
+                        line.pop();
+                        let continuation = format!("{} ", "…".dimmed());
+                        match rl.readline(&continuation) {
+                            Ok(next) => {
+                                line.push('\n');
+                                line.push_str(next.trim_end());
+                            }
+                            Err(_) => break,
+                        }
+                    }
                     let line = line.trim().to_string();
                     if line.is_empty() {
                         continue;
@@ -1612,6 +2073,7 @@ impl Repl {
             &self.mcp_clients,
             &self.skills,
             &self.settings.deny_commands,
+            &self.settings.permissions.rules,
         )?);
         Ok(())
     }
@@ -1776,9 +2238,8 @@ impl Repl {
             return Ok(());
         };
         let keep: usize = keep.parse().map_err(|_| "保留消息数需为数字".to_string())?;
-        if keep < session.messages.len() {
-            session.revert().await?;
-        }
+        // 只回滚被截断段落的文件改动（更早回合的快照保留给 /diff 与 /revert）。
+        session.revert_from(keep).await?;
         let removed = session.rewind(keep);
         self.store.save(session)?;
         println!(
@@ -2102,7 +2563,7 @@ impl Repl {
 
     fn show_permissions(&self) {
         println!("{}", "权限策略：deny 优先 → allow 规则 → ask 审批".bold());
-        println!("  read（read_file/list_dir/search_files）：作用域内自动放行");
+        println!("  read（read_file/list_dir/search_files/grep）：作用域内自动放行");
         println!("  write（write_file）：默认审批，工作区外拒绝，可 /undo 回滚");
         println!("  execute（run_command）：默认审批，危险命令直接拒绝，60s 超时");
         if self.read_only {
@@ -2285,6 +2746,8 @@ impl Repl {
         } else {
             Arc::new(ConsoleApprover {
                 stdin: self.stdin.clone(),
+                agent: Arc::clone(&self.agent),
+                workspace: self.workspace.clone(),
             })
         };
 
@@ -2337,6 +2800,8 @@ impl Repl {
                 .unwrap_or(0),
             self.session.as_ref().map(|s| s.diff().len()).unwrap_or(0),
         );
+        // B2：回合统计（耗时 / token / 成本）。
+        println!("  {}", turn_stats(&outcome).dimmed());
         Ok(())
     }
 
@@ -2442,8 +2907,63 @@ impl SharedStdin {
     }
 }
 
+/// 审批档位（A6-1 三档授权的 CLI 落地）：允许一次 / 本会话内允许 / 总是允许 / 拒绝。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ApprovalScope {
+    Once,
+    Session,
+    Always,
+    Deny,
+}
+
+/// 应用审批档位：把「本会话/总是允许」写进权限规则并返回回执文案。
+///
+/// 与 server 同口径——规则表是 `Arc` 共享热状态，改完立即对 Agent 生效；
+/// 「总是允许」同时持久化到 workspace 的 `settings.json`（重启后仍有效）。
+/// REPL（`ConsoleApprover`）与 TUI（`TuiApprover`）共用本函数。
+pub(crate) fn apply_approval_scope(
+    agent: &Agent,
+    workspace: &std::path::Path,
+    request: &PermissionRequest,
+    scope: ApprovalScope,
+) -> (Decision, Option<String>) {
+    match scope {
+        ApprovalScope::Deny => (Decision::Deny, None),
+        ApprovalScope::Once => (Decision::Allow, None),
+        ApprovalScope::Session => {
+            let note = match agent
+                .policy()
+                .remember_session_rule(&request.tool, &request.args)
+            {
+                Some(rule) => Some(format!("本会话内允许（规则 {}）", rule.pattern)),
+                None => Some("该操作不可记住（危险命令），仅本次允许".to_string()),
+            };
+            (Decision::Allow, note)
+        }
+        ApprovalScope::Always => {
+            let note = match agent.policy().remember_rule(&request.tool, &request.args, None) {
+                Some(rule) => {
+                    let mut settings = Settings::load_encrypted(workspace)
+                        .unwrap_or_else(|_| Settings::load(workspace));
+                    settings.permissions.rules = agent.policy().rules();
+                    if let Err(error) = settings.save(workspace) {
+                        Some(format!("总是允许（规则 {}；写入设置失败：{error}）", rule.pattern))
+                    } else {
+                        Some(format!("总是允许（规则 {}，已写入本机设置）", rule.pattern))
+                    }
+                }
+                None => Some("该操作不可记住（危险命令），仅本次允许".to_string()),
+            };
+            (Decision::Allow, note)
+        }
+    }
+}
+
 struct ConsoleApprover {
     stdin: SharedStdin,
+    /// 把「本会话/总是允许」写进 Agent 持有的策略（同一份共享规则表）。
+    agent: Arc<Agent>,
+    workspace: PathBuf,
 }
 
 #[async_trait]
@@ -2451,20 +2971,56 @@ impl Approver for ConsoleApprover {
     async fn decide(&self, request: &PermissionRequest) -> Decision {
         use std::io::Write;
         print!(
-            "  {} 允许 {} 执行 {}？[y/N] ",
+            "  {} 允许 {} 执行 {}？[y=允许一次 / a=本会话内 / s=总是允许 / n=拒绝] ",
             "审批".yellow(),
             request.level.label(),
             request.tool
         );
         let _ = std::io::stdout().flush();
         let mut line = String::new();
-        if self.stdin.read_line(&mut line).await.is_ok() {
+        let scope = if self.stdin.read_line(&mut line).await.is_ok() {
             match line.trim().to_lowercase().as_str() {
-                "y" | "yes" => return Decision::Allow,
-                _ => return Decision::Deny,
+                "y" | "yes" => ApprovalScope::Once,
+                "a" | "session" => ApprovalScope::Session,
+                "s" | "always" => ApprovalScope::Always,
+                _ => ApprovalScope::Deny,
             }
+        } else {
+            ApprovalScope::Deny
+        };
+        let (decision, note) = apply_approval_scope(&self.agent, &self.workspace, request, scope);
+        if let Some(note) = note {
+            println!("  {} {note}", "→".green());
         }
-        Decision::Deny
+        decision
+    }
+}
+
+#[cfg(test)]
+mod cli_completion_tests {
+    use super::{completion_candidates, longest_common_prefix, REPL_COMMANDS};
+
+    #[test]
+    fn slash_prefix_completion_lists_commands() {
+        assert_eq!(
+            completion_candidates("/per"),
+            vec!["/perception".to_string(), "/permissions".to_string()]
+        );
+        assert!(completion_candidates("/zzz").is_empty());
+        // 非命令 token 不返回命令候选（走路径补全，目录不存在时为空）。
+        assert!(!REPL_COMMANDS.is_empty() && REPL_COMMANDS.contains(&"/exit"));
+    }
+
+    #[test]
+    fn longest_common_prefix_of_candidates() {
+        let items = vec!["/perception".to_string(), "/permissions".to_string()];
+        assert_eq!(longest_common_prefix(&items), "/per");
+        assert_eq!(longest_common_prefix(&[]), "");
+        assert_eq!(
+            longest_common_prefix(&["/only".to_string()]),
+            "/only",
+            "唯一候选时前缀即自身"
+        );
     }
 }
 

@@ -96,8 +96,10 @@ pub fn sanitize_tool_result(tool: &str, content: &str) -> String {
     const TRUSTED_TOOLS: &[&str] = &[
         "read_file",
         "write_file",
+        "edit_file",
         "list_dir",
         "search_files",
+        "grep",
         "run_command",
         "use_skill",
         "subagent",

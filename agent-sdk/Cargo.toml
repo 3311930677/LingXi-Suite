@@ -5,6 +5,7 @@ members = [
     "crates/owo-agent-core",
     "crates/owo-agent-server",
     "crates/owo-agent-cli",
+    "crates/owo-agent-ime",
     "crates/owo-sim",
 ]
 
@@ -33,6 +34,9 @@ tokio-stream = { version = "0.1", features = ["sync"] }
 ed25519-dalek = "2"
 sha2 = "0.10"
 zip = "2"
+regex = "1"
 owo-agent-protocol = { path = "crates/owo-agent-protocol" }
-owo-agent-core = { path = "crates/owo-agent-core" }
-owo-agent-server = { path = "crates/owo-agent-server" }
+# 默认特性由各 crate 自己的 `default = ["native-inference"]` 决定；
+# 此处置 false 才能让 `--no-default-features` 真正向下透传（否则 Cargo 会忽略成员的覆盖）。
+owo-agent-core = { path = "crates/owo-agent-core", default-features = false }
+owo-agent-server = { path = "crates/owo-agent-server", default-features = false }

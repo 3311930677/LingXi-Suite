@@ -285,7 +285,7 @@ mod tests {
             .policy()
             .evaluate("write_file", &json!({ "path": "a.txt" }));
         assert_eq!(gate.decide(&write), Decision::Deny);
-        let inject = gate.policy().evaluate("text.inject", &json!({}));
+        let inject = gate.policy().evaluate("desktop_click", &json!({}));
         assert_eq!(gate.decide(&inject), Decision::Deny);
     }
 

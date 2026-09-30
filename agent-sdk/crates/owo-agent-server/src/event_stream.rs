@@ -567,17 +567,27 @@ async fn events_stream(
             }
         }
         loop {
-            match subscription.recv_blocking(Duration::from_millis(HEARTBEAT_INTERVAL_MS)) {
-                Some(event) => {
+            // recv_blocking 是 std Condvar 的**阻塞**等待（最长 HEARTBEAT_INTERVAL_MS）。
+            // 绝不能在 async 工作线程上直接调用：并发 SSE 连接数达到 worker 线程数时，
+            // 所有 worker 都被 park 住 → 整个 Tokio 运行时停摆（表现为服务整体无响应，
+            // 连 /health 都不回，且每轮循环再阻塞一次，永不恢复）。交给 blocking 线程池执行。
+            let sub = Arc::clone(&subscription);
+            let got = tokio::task::spawn_blocking(move || {
+                sub.recv_blocking(Duration::from_millis(HEARTBEAT_INTERVAL_MS))
+            })
+            .await;
+            match got {
+                Ok(Some(event)) => {
                     if send_frame(&tx, &event).is_err() {
                         break;
                     }
                 }
-                None => {
+                Ok(None) => {
                     if tx.send(Ok(Event::default().comment("keep-alive"))).is_err() {
                         break;
                     }
                 }
+                Err(_) => break,
             }
             if subscription.is_lagged() {
                 // 慢消费者：断开而非拖垮发布方。

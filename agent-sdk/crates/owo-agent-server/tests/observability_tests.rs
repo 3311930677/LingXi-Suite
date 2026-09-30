@@ -115,22 +115,26 @@ async fn seed_five_traces(state: &Arc<owo_agent_server::AppState>) {
             TurnEvent::ToolStart {
                 id: format!("t{i}"),
                 tool: "read_file".to_string(),
+                args: serde_json::json!({ "path": "a.txt" }),
             },
             TurnEvent::ToolResult {
                 id: format!("t{i}"),
                 tool: "read_file".to_string(),
                 ok: true,
                 error: None,
+                preview: None,
             },
             TurnEvent::ToolStart {
                 id: format!("w{i}"),
                 tool: "write_file".to_string(),
+                args: serde_json::json!({ "path": "b.txt" }),
             },
             TurnEvent::ToolResult {
                 id: format!("w{i}"),
                 tool: "write_file".to_string(),
                 ok: i % 3 != 0,
                 error: (i % 3 == 0).then(|| "denied".to_string()),
+                preview: None,
             },
         ];
         let record = trace_record(

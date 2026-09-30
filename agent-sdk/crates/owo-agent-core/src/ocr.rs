@@ -41,6 +41,17 @@ pub struct OcrEngineStatus {
     pub onnx_models_present: bool,
 }
 
+/// 本地 ONNX OCR 模型是否就绪（未编译本地推理时恒为 false）。
+#[cfg(all(target_os = "windows", feature = "native-inference"))]
+fn onnx_models_present() -> bool {
+    crate::onnx_ocr::models_present(&crate::onnx_ocr::model_dir())
+}
+
+#[cfg(not(all(target_os = "windows", feature = "native-inference")))]
+fn onnx_models_present() -> bool {
+    false
+}
+
 /// OCR 引擎诊断：语言包是否存在、最大图像尺寸、可用识别语言。
 #[cfg(target_os = "windows")]
 pub fn ocr_engine_status() -> OcrEngineStatus {
@@ -50,7 +61,7 @@ pub fn ocr_engine_status() -> OcrEngineStatus {
     OcrEngineStatus {
         engine_created,
         max_image_dimension,
-        onnx_models_present: crate::onnx_ocr::models_present(&crate::onnx_ocr::model_dir()),
+        onnx_models_present: onnx_models_present(),
     }
 }
 

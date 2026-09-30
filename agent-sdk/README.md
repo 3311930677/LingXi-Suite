@@ -10,7 +10,10 @@ Codex 式 Agent 智能体 SDK（当前基线 v0.6，桌面工作台 + 全流程�
 - HTTP API（`owo-agent-server`）：session/turn/permission/diff/revert/abort，SSE 事件流。
 - CLI（`owo-agent-cli`）：交互式 `turn` 与 `serve`。
 
-技术基线见 `../builGoal/技术文档-AI智能体输入法.md`（v0.6，只实施 Agent 智能体方案，输入法路线不实施）。
+技术基线见 `../builGoal/技术文档-AI智能体输入法.md`（v0.6）。
+**输入法集成路线已启用**（2026-09-29）：新增 `owo-agent serve-ime` 子命令实现 OwO 输入法
+Agent IPC v3 协议（命名管道 + HTTP 双面），输入法 `v` 前缀模式可直接调用本引擎——
+见下文「输入法集成（serve-ime）」。
 迭代依据：技术文档 5.8 全流程专项（M-A 场景图定位 / M-B 动作程序 / M-C 静默学习 / M-D 技能健康 / M-E 本地 ONNX OCR）与附录 C 验收基线；逐项实测记录见 `ACCEPTANCE.md`。
 
 ## 当前基线（v0.6，2026-08-14 交付面收敛）
@@ -20,6 +23,36 @@ Codex 式 Agent 智能体 SDK（当前基线 v0.6，桌面工作台 + 全流程�
 - **全流程感知/执行**：场景图 + 多源定位（UIA/OCR/视觉/模板/历史）、动作程序解释器 + 结构化断言、静默观察 + 情景记忆、技能健康度自愈、本地 ONNX OCR（ch_PP-OCRv4，纯 Rust，随包分发开箱即用）。
 - **TypeScript SDK**（`clients/ts`）：由 `/openapi.json` 生成类型与客户端，`npm run typecheck/build/test:unit` 通过。
 - **门禁与打包**：`scripts/sim-regression.py`（qq-learn/qq-observe 2/2）、`scripts/skill-gate.ps1`（12/12）、便携 zip / NSIS setup.exe / updater（含 `models/ocr` 三件套 + onnxruntime.dll）。
+
+## 输入法集成（serve-ime）
+
+`owo-agent serve-ime` 让 OwO 输入法（`OwO-release`：Windows TSF 中文拼音输入法）
+直接调用本引擎：输入法 `v` 前缀 Agent 模式 → 官方 `org.owo.agent-ipc` 连接器 →
+命名管道 `\\.\pipe\OwO.Agent.External.v1` → 本进程（协议 v3，实现于 `crates/owo-agent-ime`）。
+
+```powershell
+$env:OPENAI_API_KEY = "<key>"        # 或 OPENAI_BASE_URL 指向本地兼容端点
+owo-agent serve-ime --port 4096 --workspace <工作区>
+# 管道探针（另开终端，模拟输入法一问一答）：
+powershell -ExecutionPolicy Bypass -File scripts\ime-pipe-probe.ps1
+# 集成验收（E1~E5）：
+powershell -ExecutionPolicy Bypass -File scripts\acceptance.ps1
+```
+
+设计要点：
+
+- **单进程双面**：HTTP 面（`/session` / turn SSE / 审批 / diff）与管道面共享同一会话与审批状态，
+  桌宠 / Web 工作台连接 HTTP 面即可看到输入法任务的完整过程；
+- **数据目录互斥**：与 `serve` 共用 PidFile 锁，二者不可同时运行；`--workspace` 必须与
+  会话 workspace 一致（否则文件工具报路径越界）；
+- **审批走可信界面**：协议红线——删除/执行/支付等高风险操作不能由候选框直接授权，
+  适配器返回「打开确认界面」低风险候选，用户在工作台/桌宠中确认；
+- **管道安全**：端点仅本机、ACL 限当前用户（SDDL 与官方 mock 完全一致）、
+  单次操作超时 10s（可配 500–30000ms）、载荷上限 262144 字节；
+- **隐私**：`application.sensitive_input = true`（密码框）时 prompt 完全剥离上下文，
+  不推断应用身份；幂等键去重、`state_revision` 单调递增防旧状态覆盖；
+- **异步适配**：模型回合是秒级～分钟级，管道为 10s 一问一答——`submit` 立即返回
+  `thinking` + `retry_after_ms`，连接器轮询；cancel 触发 `POST /abort`（30s 宽限）。
 
 ## 历史落地记录（v0.4 SDK 侧）
 
@@ -275,7 +308,7 @@ cargo run -p owo-agent-cli -- serve --port 4096
 ## 当前范围（M1）
 
 - Agent loop：模型调用 → 工具执行 → 结果回填 → 停止条件（最大轮数/超时/中止）。
-- 内置工具：`read_file`、`write_file`（带快照）、`list_dir`、`search_files`、`run_command`。
+- 内置工具：`read_file`（行号+分页）、`write_file`（带快照）、`edit_file`（精准替换）、`list_dir`、`search_files`、`grep`（内容搜索）、`run_command`（超时可配）。
 - 权限策略：workspace 作用域路径校验、deny/ask/allow、命令危险模式 deny 优先。
 - 审批：CLI 交互审批、程序化 Approver（服务器审批通道）。
 - 会话：JSON 持久化、diff、revert（回滚写操作）。
@@ -296,7 +329,13 @@ cargo run -p owo-agent-cli -- serve --port 4096
 - 本地插件：`plugins/<id>/manifest.json`（id/name/version/permissions/mcp）自动发现并桥接 MCP 工具（工作区 `plugins/` 优先于 `<data>/plugins/`），`/plugins` 查看；工具名自动净化以兼容模型 API 约束。
 - 交互式 CLI：build/plan 模式、会话、diff/undo、审批、审计、AGENTS.md 初始化。
 
-## 尚未实现（M2+）
+## Roadmap（尚未落地，按优先级）
 
-- AGENTS.md 已注入；审计/用量入库（FTS5/向量索引）、桌面工作台、云执行为后续阶段。
-- 上下文压缩（仅截断）、SQLite 存储、云执行、沙箱 OS 隔离、traces/evals 平台。
+以下能力**已落地**，勿再当作待办：AGENTS.md 注入、SQLite 存储（`index.db`）、上下文压缩（模型摘要）、traces/evals、桌面工作台、Windows 沙箱（Job/AppContainer）、审计落库、存储加密（契约测试：`cargo test -p owo-agent-core --test crypto_contract`）。
+
+尚未落地：
+
+- 模型层：真实 tokenizer（现为字符数粗估，中文误差大）、Anthropic 原生 provider + prompt caching、多模态消息模型（`image_url`，当前全仓零命中）。
+- 可控性：权限规则持久化（审批 `remember` 字段已定义未消费，「总是允许」尚未生效）、循环检测/每步超时/预算熔断、hooks 系统（PreToolUse 等）。
+- 沙箱跨平台：Linux（bwrap）/macOS（sandbox-exec）真实隔离——当前非 Windows 显式 `Unsupported` 降级（可审计，不假装安全）。
+- 生态：MCP `resources`/`prompts` 能力、记忆向量召回（本地 embedding）、LSP 侧车工具、审计/用量 FTS5/向量索引。

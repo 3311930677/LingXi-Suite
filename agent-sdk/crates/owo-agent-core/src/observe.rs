@@ -393,7 +393,8 @@ mod tests {
     fn memory_store_round_trip_and_clear() {
         let (mut store, path) = temp_store();
         let observation = Observation {
-            ts: "2026-08-12T00:00:00Z".to_string(),
+            // 用当前时间戳：retention 默认 30 天，硬编码历史日期会被 new()→prune() 判过期淘汰。
+            ts: chrono::Utc::now().to_rfc3339(),
             app_id: "qq".to_string(),
             kind: "sim_event".to_string(),
             summary: "点击发送".to_string(),

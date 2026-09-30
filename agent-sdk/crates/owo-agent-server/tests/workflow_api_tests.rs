@@ -82,7 +82,9 @@ async fn body_json(response: Response<Body>) -> serde_json::Value {
     serde_json::from_slice(&bytes).unwrap()
 }
 
-const TRIGGER_MANUAL: &str = r#"{"id": "t1", "kind": {"kind": "manual"}}"#;
+// 触发器内联展开（core workflow.rs：`#[serde(flatten)]`）：
+// 形如 `{"id":"t1","kind":"manual"}`，而不是双层 `{"kind":{"kind":"manual"}}`。
+const TRIGGER_MANUAL: &str = r#"{"id": "t1", "kind": "manual"}"#;
 
 /// json! 宏内的 triggers 字面量（json! 不支持引用字符串常量展开）。
 fn trigger_manual_json() -> serde_json::Value {

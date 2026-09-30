@@ -201,6 +201,90 @@ pub fn process_alive(pid: u32) -> bool {
     }
 }
 
+/// 服务进程探测：pid 存活 **且** 镜像名是 owo-agent（pid 文件守卫专用）。
+///
+/// 只看 `process_alive` 不够：强杀后 pid 文件残留、pid 被无关进程（含权限更高的系统进程）复用，
+/// 此时 OpenProcess 返回 ACCESS_DENIED 被保守判为「存活」，启动会被误挡（实测停服后立即重启即触发）。
+/// Toolhelp 快照读取镜像名不需要目标进程权限，可准确区分。
+pub fn is_agent_process(pid: u32) -> bool {
+    if !process_alive(pid) {
+        return false;
+    }
+    #[cfg(windows)]
+    {
+        match process_image_name(pid) {
+            Some(name) => {
+                name.eq_ignore_ascii_case("owo-agent.exe") || name.eq_ignore_ascii_case("owo-agent")
+            }
+            // 快照不可用时保守视为服务进程（宁可提示也不要双开写同一数据目录）。
+            None => true,
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        true
+    }
+}
+
+/// 通过 Toolhelp 快照读取 pid 对应的镜像名（无需目标进程权限）。
+#[cfg(windows)]
+fn process_image_name(pid: u32) -> Option<String> {
+    use std::os::windows::ffi::OsStringExt;
+
+    type WinHandle = *mut core::ffi::c_void;
+
+    const TH32CS_SNAPPROCESS: u32 = 0x0000_0002;
+    const INVALID_HANDLE_VALUE: isize = -1;
+
+    #[repr(C)]
+    struct ProcessEntry32W {
+        dw_size: u32,
+        cnt_usage: u32,
+        th32_process_id: u32,
+        th32_default_heap_id: usize,
+        th32_module_id: u32,
+        cnt_threads: u32,
+        th32_parent_process_id: u32,
+        pc_pri_class_base: i32,
+        dw_flags: u32,
+        sz_exe_file: [u16; 260],
+    }
+
+    unsafe extern "system" {
+        fn CreateToolhelp32Snapshot(flags: u32, process_id: u32) -> WinHandle;
+        fn Process32FirstW(snapshot: WinHandle, entry: *mut ProcessEntry32W) -> i32;
+        fn Process32NextW(snapshot: WinHandle, entry: *mut ProcessEntry32W) -> i32;
+        fn CloseHandle(h_object: WinHandle) -> i32;
+    }
+
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+    if snapshot.is_null() || snapshot as isize == INVALID_HANDLE_VALUE {
+        return None;
+    }
+    let mut entry: ProcessEntry32W = unsafe { std::mem::zeroed() };
+    entry.dw_size = std::mem::size_of::<ProcessEntry32W>() as u32;
+    let mut name = None;
+    let mut has_entry = unsafe { Process32FirstW(snapshot, &mut entry) } != 0;
+    while has_entry {
+        if entry.th32_process_id == pid {
+            let end = entry
+                .sz_exe_file
+                .iter()
+                .position(|unit| *unit == 0)
+                .unwrap_or(entry.sz_exe_file.len());
+            name = Some(
+                std::ffi::OsString::from_wide(&entry.sz_exe_file[..end])
+                    .to_string_lossy()
+                    .to_string(),
+            );
+            break;
+        }
+        has_entry = unsafe { Process32NextW(snapshot, &mut entry) } != 0;
+    }
+    unsafe { CloseHandle(snapshot) };
+    name
+}
+
 /// 服务 pid 文件（存活标记；正常退出 Drop 时清理，强杀后由 recover_force_kill 清理）。
 pub struct PidFile {
     path: PathBuf,
@@ -245,7 +329,7 @@ pub fn recover_force_kill(
         .ok()
         .and_then(|content| content.trim().parse::<u32>().ok());
     match stale_pid {
-        Some(pid) if process_alive(pid) => {
+        Some(pid) if is_agent_process(pid) => {
             return Err(format!(
                 "检测到运行中的服务（pid={pid}，pid 文件 {}）：请先停止该进程再启动",
                 path.display()

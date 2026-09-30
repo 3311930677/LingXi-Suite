@@ -1,10 +1,18 @@
 //! OwO Agent SDK 核心库（M1）：
 //! Agent loop、工具注册表、权限审批、会话、审计、模型网关。
 
+/// 环境变量相关单测的进程级串行锁：settings / gateway 等模块共享同一把锁，
+/// 避免两个模块并行改写同一个环境变量时互相把断言打翻。
+#[cfg(test)]
+pub(crate) static ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 pub mod accessibility;
 pub mod action_program;
 pub mod agent;
+pub mod anthropic;
 pub mod assert;
+pub mod git_tools;
+pub mod web_tools;
 pub mod audit;
 pub mod audit_chain;
 pub mod automation;
@@ -28,24 +36,28 @@ pub mod fleet;
 pub mod fleet_transport;
 pub mod gateway;
 pub mod goal;
+pub mod hooks;
 pub mod injection;
 pub mod learn;
 pub mod lease;
 pub mod locate;
+pub mod loop_guard;
 pub mod mcp;
 pub mod memory;
 pub mod node_agent;
 pub mod notes;
 pub mod observe;
 pub mod ocr;
-#[cfg(target_os = "windows")]
+#[cfg(all(target_os = "windows", feature = "native-inference"))]
 pub mod onnx_ocr;
 pub mod paddle_ocr;
 pub mod perception;
 pub mod permissions;
 pub mod plan;
+pub mod plan_tools;
 pub mod platform;
 pub mod plugin;
+pub mod question;
 pub mod remote_step;
 pub mod sandbox;
 pub mod scene;
@@ -60,6 +72,7 @@ pub mod sqlite_store;
 pub mod storage_crypto;
 pub mod stt;
 pub mod subagent;
+pub mod tokenizer;
 pub mod tools;
 pub mod trace;
 pub mod vision;
@@ -138,7 +151,7 @@ pub use fleet_transport::{
     TransportTask, TransportWorker,
 };
 pub use gateway::{
-    budget_violation, parse_usage_value, ChatMessage, ModelOutput, ModelProvider,
+    budget_violation, parse_usage_value, ChatMessage, MessageImage, ModelOutput, ModelProvider,
     OpenAiCompatibleConfig, OpenAiCompatibleProvider, TokenUsage, ToolCall,
 };
 pub use goal::{
@@ -152,7 +165,8 @@ pub use learn::{
     SuggestionAction,
 };
 pub use lease::{Lease, LeaseConfig, LeaseError, LeaseManager};
-pub use mcp::{McpClient, McpRegistry, McpServerConfig, McpTool};
+pub use loop_guard::{LoopDetector, LoopVerdict};
+pub use mcp::{McpClient, McpPrompt, McpRegistry, McpResource, McpServerConfig, McpTool};
 pub use node_agent::{NodeAgent, NodeStatus};
 pub use notes::{
     add_block, append_child, block_text, doc_title, doc_to_md, generate_mixed_doc, get_block,
@@ -173,8 +187,12 @@ pub use perception::{
     CaptureMeta, ContentRef, ForegroundApp, PerceptionEvent, PerceptionLayer, SituationSnapshot,
     SituationStore, TaskHypothesis, UiContext,
 };
-pub use permissions::{Approver, Decision, Level, PermissionRequest, Policy};
+pub use permissions::{
+    Approver, Decision, Level, PermissionRequest, PermissionRule, Policy, RuleDecision,
+    HARD_DENY_FRAGMENTS,
+};
 pub use plan::{verify_output, Plan, StepSpec, StepStatus, VerificationSpec};
+pub use plan_tools::{PlanStep, SessionPlan, UpdatePlanTool, PLAN_TOOL_NAME};
 pub use platform::{capture_screen, clipboard_sequence, poll_foreground_app};
 pub use plugin::{
     discover_plugins, plugin_mcp_config, scan_plugin_for_risks, verify_plugin_signature,
@@ -182,6 +200,7 @@ pub use plugin::{
     PluginManager, PluginManifest, PluginReviewState, PluginSignature, PluginStateStore,
     PluginSubmission, VersionsJson,
 };
+pub use question::{QuestionAnswer, Questioner, UserQuestion};
 pub use remote_step::{
     approval_request_event, approve_transport_task, submit_via_transport,
     submit_via_transport_with_timeout, ApprovalSpec, EvidenceItem, RemoteStep, RemoteStepEvent,
@@ -210,6 +229,10 @@ pub use skill_pack::{
 };
 pub use sqlite_store::SqliteSessionStore;
 pub use stt::{LocalStt, SttOutcome};
+pub use tokenizer::{
+    budget_from_window, context_window_for_model, default_counter, tokenizer_name, TiktokenCounter,
+    TokenCounter,
+};
 pub use tools::{Tool, ToolContext, ToolRegistry, ToolSpec};
 pub use trace::{list_traces, load_trace, save_trace, TraceRecord};
 pub use vision::{

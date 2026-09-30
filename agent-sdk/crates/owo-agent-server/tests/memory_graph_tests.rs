@@ -25,6 +25,9 @@ impl owo_agent_core::gateway::ModelProvider for IdleProvider {
 }
 
 async fn test_state() -> (Arc<AppState>, tempfile::TempDir) {
+    // 预置数据用固定历史日期，而 MemoryStore::new() 会按保留期（默认 30 天）
+    // prune 最旧条目；放宽保留期，避免数据入库即被淘汰。
+    std::env::set_var("OWO_MEMORY_RETENTION_DAYS", "36500");
     let temp = tempfile::tempdir().unwrap();
     let workspace = temp.path().join("ws");
     std::fs::create_dir_all(&workspace).unwrap();

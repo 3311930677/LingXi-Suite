@@ -13,6 +13,10 @@ pub struct SnapshotEntry {
     /// None 表示文件原本不存在（回滚时删除）。
     #[serde(default)]
     pub original_b64: Option<String>,
+    /// 回合归属：记录快照时该回合用户消息的下标（= 写文件那一刻的 messages.len()）。
+    /// 供 /undo（rewind）只回滚被截断段落的写操作；旧数据回退为 0（视作最早回合）。
+    #[serde(default)]
+    pub turn: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -46,6 +50,9 @@ pub struct Session {
     /// 置顶标记（列表优先）。
     #[serde(default)]
     pub pinned: bool,
+    /// 多步任务计划（`update_plan` 工具写入；UI 渲染进度）。
+    #[serde(default)]
+    pub plan: Option<crate::plan_tools::SessionPlan>,
 }
 
 impl Session {
@@ -71,10 +78,12 @@ impl Session {
             title: None,
             archived: false,
             pinned: false,
+            plan: None,
         }
     }
 
-    /// 展示标题：优先自定义标题，否则取首条用户消息，最后回退为会话短 ID。
+    /// 展示标题：优先自定义标题，否则从首条用户消息提炼，最后回退为会话短 ID。
+    /// 直接截前 40 字会把换行、列表符、附件前缀等噪声带进侧栏，这里先取首个有效行再截断。
     pub fn display_title(&self) -> String {
         if let Some(title) = &self.title {
             let trimmed = title.trim();
@@ -88,9 +97,8 @@ impl Session {
             .find(|message| message.role == "user")
             .and_then(|message| message.content.as_deref())
         {
-            let trimmed = first.trim();
-            if !trimmed.is_empty() {
-                return trimmed.chars().take(40).collect();
+            if let Some(title) = summarize_prompt_title(first) {
+                return title;
             }
         }
         let short_id: String = self.id.chars().take(8).collect();
@@ -146,8 +154,33 @@ impl Session {
 
     /// 回滚全部已快照的写操作，返回被恢复的路径。
     pub async fn revert(&mut self) -> Result<Vec<String>, AgentError> {
+        let restored = self.restore_snapshots(|_| true).await?;
+        self.snapshots.clear();
+        self.updated_at = Utc::now().to_rfc3339();
+        Ok(restored)
+    }
+
+    /// 只回滚「首条消息下标 >= keep」的回合写操作（配合 rewind：撤销被截断段落落的文件改动），
+    /// 更早回合的快照保留：`/diff` 与后续 `/revert` 依旧能看到、回滚它们。
+    pub async fn revert_from(&mut self, keep: usize) -> Result<Vec<String>, AgentError> {
+        let restored = self
+            .restore_snapshots(|snapshot| snapshot.turn >= keep)
+            .await?;
+        self.snapshots.retain(|_, snapshot| snapshot.turn < keep);
+        self.updated_at = Utc::now().to_rfc3339();
+        Ok(restored)
+    }
+
+    /// 按谓词回滚快照对应的文件（不动快照表本身），返回被恢复的路径。
+    async fn restore_snapshots(
+        &self,
+        wanted: impl Fn(&SnapshotEntry) -> bool,
+    ) -> Result<Vec<String>, AgentError> {
         let mut restored = Vec::new();
         for (path, snapshot) in &self.snapshots {
+            if !wanted(snapshot) {
+                continue;
+            }
             let target = PathBuf::from(path);
             match &snapshot.original_b64 {
                 Some(encoded) => {
@@ -165,8 +198,6 @@ impl Session {
             }
             restored.push(relative_display(&self.workspace, &target));
         }
-        self.snapshots.clear();
-        self.updated_at = Utc::now().to_rfc3339();
         Ok(restored)
     }
 
@@ -195,17 +226,20 @@ impl Session {
             title: None,
             archived: false,
             pinned: false,
+            // fork 出的是新会话：计划从空开始。
+            plan: None,
         }
     }
 
-    /// 回退到仅保留前 `keep` 条消息，同时清空文件快照；返回被移除的历史。
+    /// 回退到仅保留前 `keep` 条消息，同时丢弃被截断段落的文件快照（其文件改动已由
+    /// `revert_from(keep)` 回滚，剩余快照留给 /diff 与 /revert）；返回被移除的历史。
     pub fn rewind(&mut self, keep: usize) -> Vec<ChatMessage> {
         if keep >= self.messages.len() {
             return Vec::new();
         }
         let removed = self.messages.split_off(keep);
         self.redo_stack.push(removed.clone());
-        self.snapshots.clear();
+        self.snapshots.retain(|_, snapshot| snapshot.turn < keep);
         self.updated_at = Utc::now().to_rfc3339();
         removed
     }
@@ -240,12 +274,33 @@ impl Session {
     }
 }
 
+/// 侧栏标题长度上限：一眼能读完，超出补省略号（完整提示词仍在会话内可见）。
+const TITLE_MAX_CHARS: usize = 24;
+
+/// 从首条用户消息提炼标题：取首个非空行，剥掉 Markdown 列表符/引用符与空白噪声。
+fn summarize_prompt_title(content: &str) -> Option<String> {
+    let line = content
+        .lines()
+        .map(|line| line.trim().trim_start_matches(['#', '-', '*', '>']).trim())
+        .find(|line| !line.is_empty())?;
+    let mut title: String = line.chars().take(TITLE_MAX_CHARS).collect();
+    if line.chars().count() > TITLE_MAX_CHARS {
+        title.push('…');
+    }
+    Some(title)
+}
+
 fn relative_display(workspace: &Path, path: &Path) -> String {
     let normalize = |value: &Path| -> String {
         let raw = value.to_string_lossy().replace('\\', "/");
         raw.strip_prefix("//?/").unwrap_or(&raw).to_string()
     };
-    let workspace = normalize(workspace);
+    // 两侧都取 canonical 形式再比较：否则 8.3 短名/大小写差异
+    // （如 Administrator ↔ ADMINI~1）会让 strip_prefix 失败并退化成绝对路径。
+    let workspace = workspace
+        .canonicalize()
+        .map(|resolved| normalize(&resolved))
+        .unwrap_or_else(|_| normalize(workspace));
     let path = normalize(path);
     path.strip_prefix(&workspace)
         .map(|relative| relative.trim_start_matches('/').to_string())
@@ -289,6 +344,13 @@ pub trait SessionStore: Send + Sync {
     /// 清空会话与审计（R8 存储运维；默认不支持，SQLite 存储提供实现）。
     fn clear(&self) -> Result<(), AgentError> {
         Err(AgentError::Session("当前存储不支持清空".into()))
+    }
+
+    /// 删除单个会话（默认不支持；SQLite 存储提供实现）。返回是否存在并被删除。
+    /// 语义：只删会话记录本身，审计留痕不级联；fork 子会话保留（父消失后按根会话显示）。
+    fn delete(&self, id: &str) -> Result<bool, AgentError> {
+        let _ = id;
+        Err(AgentError::Session("当前存储不支持删除会话".into()))
     }
 
     /// 存储是否处于只读降级（R8：迁移失败后的安全状态；默认否）。
@@ -493,6 +555,7 @@ mod tests {
             path.to_string_lossy().replace('\\', "/"),
             SnapshotEntry {
                 original_b64: Some(BASE64.encode("before")),
+                turn: 0,
             },
         );
 
@@ -520,6 +583,7 @@ mod tests {
             path.to_string_lossy().replace('\\', "/"),
             SnapshotEntry {
                 original_b64: Some(BASE64.encode("before")),
+                turn: 0,
             },
         );
 
@@ -528,6 +592,48 @@ mod tests {
         assert!(removed.is_empty());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "after");
         assert!(!session.snapshots.is_empty());
+        let _ = std::fs::remove_dir_all(&workspace);
+    }
+
+    #[tokio::test]
+    async fn revert_from_rolls_back_only_later_turns() {
+        let workspace =
+            std::env::temp_dir().join(format!("owo-session-revert-from-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&workspace).unwrap();
+        let early = workspace.join("early.txt");
+        let late = workspace.join("late.txt");
+        std::fs::write(&early, "early-v2").unwrap();
+        std::fs::write(&late, "late-v2").unwrap();
+
+        let mut session = Session::new(&workspace, "mock", None);
+        for index in 0..4 {
+            session.push(ChatMessage::user(format!("m{index}")));
+        }
+        let early_key = early.to_string_lossy().replace('\\', "/");
+        session.snapshots.insert(
+            early_key.clone(),
+            SnapshotEntry {
+                original_b64: Some(BASE64.encode("early-v1")),
+                turn: 0,
+            },
+        );
+        session.snapshots.insert(
+            late.to_string_lossy().replace('\\', "/"),
+            SnapshotEntry {
+                original_b64: Some(BASE64.encode("late-v1")),
+                turn: 2,
+            },
+        );
+
+        let restored = session.revert_from(2).await.unwrap();
+        let removed = session.rewind(2);
+
+        assert_eq!(restored.len(), 1);
+        assert_eq!(removed.len(), 2);
+        assert_eq!(std::fs::read_to_string(&late).unwrap(), "late-v1");
+        assert_eq!(std::fs::read_to_string(&early).unwrap(), "early-v2");
+        assert_eq!(session.snapshots.len(), 1);
+        assert!(session.snapshots.contains_key(&early_key));
         let _ = std::fs::remove_dir_all(&workspace);
     }
 
@@ -579,5 +685,25 @@ mod tests {
         assert!(!child.pinned);
         assert!(!child.archived);
         assert_eq!(child.display_title(), "给 parseConfig 补测试");
+    }
+
+    #[test]
+    fn display_title_strips_markdown_prefix_and_clips_long_prompt() {
+        let mut session = Session::new(".", "mock", None);
+        session.push(ChatMessage::user(
+            "\n\n- 重构会话存储层以支持删除操作并补充完整的迁移记录与回归测试\n第二行不该出现在标题里"
+                .to_string(),
+        ));
+        let title = session.display_title();
+        assert!(title.starts_with("重构会话存储层"), "{title}");
+        assert!(
+            !title.contains('\n') && !title.contains("第二行"),
+            "标题不应带换行或第二行内容：{title}"
+        );
+        assert_eq!(
+            title.chars().count(),
+            TITLE_MAX_CHARS + 1,
+            "超长提示词应截断并补省略号：{title}"
+        );
     }
 }

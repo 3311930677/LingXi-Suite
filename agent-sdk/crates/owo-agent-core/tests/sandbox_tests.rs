@@ -84,6 +84,23 @@ fn command_cwd_outside_workspace_rejected() {
 }
 
 #[test]
+fn command_cwd_inside_workspace_verbatim_form_accepted() {
+    let workspace = workspace_dir();
+    std::fs::create_dir_all(&workspace).unwrap();
+    let policy = SandboxPolicy::for_workspace("demo", workspace.clone());
+    let mut command = SandboxCommand::new("app.exe", policy);
+    // 真实工具链里 cwd 经 canonicalize（Windows 带 `\\?\` 前缀），
+    // 与未 canonicalize 的工作区混用不得误报「工作目录越界」。
+    command.cwd = Some(
+        workspace
+            .canonicalize()
+            .unwrap_or_else(|_| workspace.clone()),
+    );
+    assert!(command.validate().is_ok());
+    let _ = std::fs::remove_dir_all(&workspace);
+}
+
+#[test]
 fn deny_program_blocked_by_blacklist() {
     let workspace = workspace_dir();
     let policy = SandboxPolicy::for_workspace("demo", workspace);

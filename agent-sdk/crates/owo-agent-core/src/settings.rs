@@ -210,12 +210,25 @@ pub struct UsageSettings {
     pub output_price_per_mtok: f64,
 }
 
+/// 模型服务接入（设置页「配置」选项卡的唯一事实源，优先于环境变量）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ModelProviderSettings {
+    /// OpenAI 兼容端点（如 `https://api.deepseek.com/v1`）。留空 = 回退环境变量。
+    pub base_url: Option<String>,
+    /// API 密钥：只写进加密信封 `settings.json.owo-crypt`，明文 settings.json 恒为 None。
+    pub api_key: Option<String>,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
     /// 默认模型（低于环境变量与命令行参数）。
     #[serde(default)]
     pub model: Option<String>,
+    /// 模型服务接入（端点 + 密钥），设置页保存后优先于环境变量。
+    #[serde(default)]
+    pub provider: ModelProviderSettings,
     /// 启动默认只读（plan）模式。
     #[serde(default)]
     pub read_only: bool,
@@ -252,6 +265,26 @@ pub struct Settings {
     /// v0.4.30 模型用量预算。
     #[serde(default)]
     pub usage: UsageSettings,
+    /// 推理档位（`reasoning_effort`）：minimal / low / medium / high。
+    /// 留空 = 不发送该参数（用模型自身默认）；只有显式选择时才写入请求体，
+    /// 避免不支持该字段的 OpenAI 兼容端点直接 400。
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
+    /// 权限规则（审批卡片「记住」产生；重启后仍生效，硬拒绝类命令永不入表）。
+    #[serde(default)]
+    pub permissions: PermissionRulesSettings,
+    /// Hooks 生命周期扩展点（A2-1）：`hooks: [{event, matcher?, command}]`。
+    /// exit code 2 = 阻断并把 stderr 回喂模型；命令经系统 shell 执行。
+    #[serde(default)]
+    pub hooks: Vec<crate::hooks::HookConfig>,
+}
+
+/// 权限规则持久化容器（写入 `settings.json` 的 `permissions` 节）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PermissionRulesSettings {
+    /// 用户记住的规则列表。
+    pub rules: Vec<crate::permissions::PermissionRule>,
 }
 
 impl Settings {
@@ -266,12 +299,45 @@ impl Settings {
     }
 
     pub fn save(&self, workspace: &Path) -> Result<(), String> {
+        // 明文 settings.json 绝不含密钥：先剥掉 api_key 再序列化落盘。
+        let mut plain = self.clone();
+        plain.provider.api_key = None;
         let path = workspace.join("settings.json");
         std::fs::write(
             &path,
-            serde_json::to_string_pretty(self).map_err(|error| error.to_string())?,
+            serde_json::to_string_pretty(&plain).map_err(|error| error.to_string())?,
         )
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string())?;
+        // 密钥单独写 DPAPI 信封（绑定当前 Windows 账户，解密不需密码）。
+        // 信封持有完整配置（含密钥）且 load_encrypted 优先读它，因此这里必须与明文
+        // 同步重写：只在「本次带密钥」时写会留下旧信封，读取时旧值胜出，导致改端点/
+        // 模型的保存静默不生效（曾实测 base_url 更新被旧信封覆盖）。
+        // 本次未提供密钥（None/空串，读-改-写路径如 egress、白名单同款 save）时，
+        // 解密旧信封取已保存的 key 合并，避免把已有密钥冲掉。
+        let envelope = workspace.join("settings.json.owo-crypt");
+        let provided = self
+            .provider
+            .api_key
+            .as_deref()
+            .filter(|key| !key.trim().is_empty())
+            .map(str::to_string);
+        let existing = if provided.is_none() && envelope.exists() {
+            crate::storage_crypto::decrypt_file_envelope(&envelope)
+                .ok()
+                .and_then(|content| serde_json::from_slice::<Settings>(&content).ok())
+                .and_then(|settings| settings.provider.api_key)
+                .filter(|key| !key.trim().is_empty())
+        } else {
+            None
+        };
+        if let Some(key) = provided.or(existing) {
+            let mut full = self.clone();
+            full.provider.api_key = Some(key);
+            let content = serde_json::to_vec_pretty(&full).map_err(|error| error.to_string())?;
+            crate::storage_crypto::encrypt_file_envelope(&envelope, &content)
+                .map_err(|error| error.to_string())?;
+        }
+        Ok(())
     }
 
     /// 加密落盘（R9）：`settings.json.owo-crypt` 信封加密；settings 仍零明文密钥
@@ -295,6 +361,17 @@ impl Settings {
         Ok(Self::load(workspace))
     }
 
+    /// 注册已保存的模型接入为进程内覆盖（优先于环境变量）。
+    /// 必须在任何 `OpenAiCompatibleConfig::from_env()` 之前调用，否则保存的
+    /// 端点/密钥不会生效——CLI 的 build_agent_with_mcp 就在 AppState 之前跑。
+    pub fn apply_provider_override(&self) {
+        crate::gateway::set_provider_override(
+            self.provider.base_url.clone(),
+            self.provider.api_key.clone(),
+            self.model.clone(),
+        );
+    }
+
     /// 把用量预算配置写回环境变量（provider 每次调用前读取，即时生效）。
     /// None 字段清除对应环境变量，避免旧值残留。
     pub fn apply_usage_env(&self) {
@@ -314,6 +391,21 @@ impl Settings {
             "OWO_MODEL_OUTPUT_PRICE_PER_MTOK",
             self.usage.output_price_per_mtok.to_string(),
         );
+    }
+
+    /// 把推理档位写回环境变量（provider 每次请求前读取，设置页保存后即时生效）。
+    /// 仅接受 minimal/low/medium/high：其余取值（含空串）一律清除变量 = 不下发该参数。
+    pub fn apply_reasoning_env(&self) {
+        let normalized = self
+            .reasoning_effort
+            .as_deref()
+            .map(str::trim)
+            .map(str::to_ascii_lowercase)
+            .filter(|value| matches!(value.as_str(), "minimal" | "low" | "medium" | "high"));
+        match normalized {
+            Some(value) => std::env::set_var("OWO_REASONING_EFFORT", value),
+            None => std::env::remove_var("OWO_REASONING_EFFORT"),
+        }
     }
 }
 
@@ -504,5 +596,35 @@ mod tests {
         assert!(std::env::var("OWO_USAGE_COST_BUDGET_USD").is_err());
         std::env::remove_var("OWO_MODEL_INPUT_PRICE_PER_MTOK");
         std::env::remove_var("OWO_MODEL_OUTPUT_PRICE_PER_MTOK");
+    }
+
+    #[test]
+    fn apply_reasoning_env_only_accepts_known_levels() {
+        // 与 gateway 的档位下发测试共用同一把锁：两处都读写 OWO_REASONING_EFFORT。
+        let _guard = crate::ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut settings = Settings {
+            reasoning_effort: Some(" HIGH ".to_string()),
+            ..Settings::default()
+        };
+        settings.apply_reasoning_env();
+        assert_eq!(std::env::var("OWO_REASONING_EFFORT").as_deref(), Ok("high"));
+
+        // 非法档位 → 清除变量（等于不下发该参数，回落模型默认）。
+        settings.reasoning_effort = Some("unsupported".to_string());
+        settings.apply_reasoning_env();
+        assert!(std::env::var("OWO_REASONING_EFFORT").is_err());
+
+        settings.reasoning_effort = Some("medium".to_string());
+        settings.apply_reasoning_env();
+        assert_eq!(
+            std::env::var("OWO_REASONING_EFFORT").as_deref(),
+            Ok("medium")
+        );
+
+        settings.reasoning_effort = None;
+        settings.apply_reasoning_env();
+        assert!(std::env::var("OWO_REASONING_EFFORT").is_err());
     }
 }

@@ -18,6 +18,10 @@
 //!
 //! 本模块不引用 `crate::`/`super::`，可被测试以 `#[path] mod` 独立编译；
 //! AppState 写全限定 `owo_agent_server::AppState`。
+//!
+//! 经 `#[path]` 独立编译进测试单元时，路由挂载等入口在该单元内无调用方属预期，
+//! 故 test 编译下放行 dead_code（lib 正常编译时本属性不生效，路径全部被 lib.rs 挂载）。
+#![cfg_attr(test, allow(dead_code))]
 
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
@@ -144,7 +148,9 @@ impl UsageStore {
                 prompt_tokens,
                 completion_tokens,
                 duration_ms,
-                cost_usd: (cost * 1_000_000.0).round() / 1_000_000.0,
+                // 单次请求成本常低于 1 微美元（150 token × 默认单价 ≈ 3e-7），
+                // 量化到微美元会被抹成 0，导致 /usage 报表成本恒为 0；按纳美元保留。
+                cost_usd: (cost * 1_000_000_000.0).round() / 1_000_000_000.0,
                 at_ms: now_ms(),
             });
             while records.len() > USAGE_RECORDS_CAP {
@@ -325,10 +331,11 @@ impl UsageStore {
                     "completion_tokens": ctok,
                     "total_tokens": ptok + ctok,
                     "duration_ms": dur,
-                    "cost_usd": (cost * 1000.0).round() / 1000.0,
+                    // 同上：小额成本需保留纳美元精度，否则聚合显示恒为 0。
+                    "cost_usd": (cost * 1_000_000_000.0).round() / 1_000_000_000.0,
                     "budget": budget.map(|b| json!({
                         "limit_usd": b.limit_usd,
-                        "spent_usd": (b.spent_usd * 1000.0).round() / 1000.0,
+                        "spent_usd": (b.spent_usd * 1_000_000_000.0).round() / 1_000_000_000.0,
                         "exceeded": b.spent_usd > b.limit_usd,
                     })),
                 })
