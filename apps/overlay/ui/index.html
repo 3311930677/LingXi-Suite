@@ -1,0 +1,394 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>灵犀 · 跨应用改写</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <!-- Backdrop only exists in the browser preview; the Tauri window is
+         transparent so the card floats directly over the desktop. -->
+    <div class="preview-backdrop"></div>
+
+    <main class="card" id="card" role="dialog" aria-label="改写建议">
+      <header class="titlebar" id="titlebar">
+        <div class="brand">
+          <span class="logo" aria-hidden="true">
+            <svg viewBox="0 0 24 24" width="13" height="13" fill="currentColor"><ellipse cx="7" cy="8.2" rx="2" ry="2.7"/><ellipse cx="12" cy="6.6" rx="2" ry="2.7"/><ellipse cx="17" cy="8.2" rx="2" ry="2.7"/><path d="M12 11c-3.1 0-5.6 2.3-5.6 4.9 0 1.9 1.5 3.1 3.2 2.8 1-.2 1.6-.4 2.4-.4s1.4.2 2.4.4c1.7.3 3.2-.9 3.2-2.8 0-2.6-2.5-4.9-5.6-4.9z"/></svg>
+          </span>
+          <span class="brand-name">灵犀</span>
+          <span class="brand-sub">桌面智能助手</span>
+        </div>
+        <div class="win-actions">
+          <button class="icon-btn" id="pin-btn" title="置顶" aria-label="置顶">
+            <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 17v5"/><path d="M9 10.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24V16a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-.76a2 2 0 0 0-1.11-1.79l-1.78-.9A2 2 0 0 1 15 10.76V6h1a2 2 0 0 0 0-4H8a2 2 0 0 0 0 4h1z"/></svg>
+          </button>
+          <button class="icon-btn" id="close-btn" title="关闭 (Esc)" aria-label="关闭">
+            <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>
+          </button>
+          <button class="icon-btn" id="pet-toggle-btn" title="隐藏桌宠" aria-label="显示或隐藏桌宠">
+            <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3c-4.4 0-8 3.1-8 7 0 2.4 1.3 4.5 3.3 5.8-.2 1-.7 2-1.5 2.9-.2.2 0 .6.3.5 1.8-.4 3-1.1 3.8-1.8.7.1 1.4.2 2.1.2 4.4 0 8-3.1 8-7s-3.6-7-8-7Z"/><path d="M9 10.5h.01"/><path d="M12 10.5h.01"/><path d="M15 10.5h.01"/></svg>
+          </button>
+          <button class="icon-btn" id="quit-btn" title="退出灵犀" aria-label="退出灵犀">
+            <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><path d="m16 17 5-5-5-5"/><path d="M21 12H9"/></svg>
+          </button>
+        </div>
+      </header>
+
+      <section class="tools-row">
+        <button class="tool-tab is-active" id="agent-tab">
+          <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14 9V5a3 3 0 0 0-3-3l-4 9v11h11.3a1 1 0 0 0 1-.7l2-6a1 1 0 0 0-1-1.3Z"/><path d="M7 22H4a2 2 0 0 1-2-2v-7a2 2 0 0 1 2-2h3"/></svg>
+          对话</button>
+        <button class="tool-tab" id="tools-tab">
+          <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg>
+          工具</button>
+        <button class="tool-tab" id="settings-btn">
+          <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .34 1.87l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.7 1.7 0 0 0-1.87-.34 1.7 1.7 0 0 0-1 1.55V21a2 2 0 1 1-4 0v-.09a1.7 1.7 0 0 0-1.11-1.55 1.7 1.7 0 0 0-1.87.34l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.7 1.7 0 0 0 .34-1.87 1.7 1.7 0 0 0-1.55-1H3a2 2 0 1 1 0-4h.09a1.7 1.7 0 0 0 1.55-1.11 1.7 1.7 0 0 0-.34-1.87l-.06-.06A2 2 0 1 1 7.07 4.2l.06.06a1.7 1.7 0 0 0 1.87.34h.08a1.7 1.7 0 0 0 1-1.55V3a2 2 0 1 1 4 0v.09a1.7 1.7 0 0 0 1 1.55 1.7 1.7 0 0 0 1.87-.34l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.7 1.7 0 0 0-.34 1.87v.08a1.7 1.7 0 0 0 1.55 1H21a2 2 0 1 1 0 4h-.09a1.7 1.7 0 0 0-1.51 1Z"/></svg>
+          设置</button>
+        <span class="backend-badge" id="backend-badge">本地</span>
+      </section>
+
+      <!-- 改写模式：只属于「改写」视图，切换到其他页时由 JS 隐藏 -->
+      <nav class="modes" id="modes" aria-label="改写模式">
+        <button class="chip is-active" data-mode="polish" title="保留全部原意，按原文场景丰富并提升表达">润色</button>
+        <button class="chip" data-mode="proofread" title="只修正错别字、标点和语法">纠错</button>
+        <button class="chip featured" data-mode="prompt-enhance" title="补全角色、目标、约束、输出格式与示例">提示词增强</button>
+      </nav>
+
+      <section class="diff-wrap" id="rewrite-view" hidden>
+        <div class="diff-head">
+          <span class="diff-title">改动预览</span>
+          <button class="mini-btn" id="recapture-btn" title="从当前应用抓取选中的文字，等同 Ctrl+Alt+Space">读取选中</button>
+          <span class="stat" id="stat">
+            <span class="add" id="stat-add">+0</span>
+            <span class="del" id="stat-del">-0</span>
+          </span>
+        </div>
+        <div class="task-progress" id="task-progress" hidden aria-live="polite">
+          <div class="progress-row">
+            <span class="progress-spinner" aria-hidden="true"></span>
+            <span class="progress-stage" id="progress-stage">正在准备任务…</span>
+            <span class="progress-time" id="progress-time">0.0s</span>
+          </div>
+          <div class="progress-track"><span id="progress-bar"></span></div>
+          <span class="progress-detail" id="progress-detail">灵犀正在理解原文，不会把它当作聊天问题回答</span>
+        </div>
+        <div class="diff" id="diff" tabindex="0" aria-live="polite"></div>
+      </section>
+
+      <section class="qq-view" id="qq-view" hidden>
+        <div class="qq-message-head"><span id="qq-conversation">前台 QQ 会话</span><button class="mini-btn" id="qq-refresh">读取选中</button></div>
+        <div class="qq-message" id="qq-message">在 QQ 中选中对方的一条消息后点击「读取选中」，将基于该内容生成回复草稿；是否写入由你确认，不会自动发送。</div>
+        <label for="qq-draft">回复草稿（确认后才写入，不会自动发送）</label>
+        <textarea id="qq-draft" placeholder="草稿会出现在这里，你可以随手改几句再写入 QQ"></textarea>
+        <div class="qq-actions"><button class="btn ghost" id="qq-generate">生成草稿</button><button class="btn primary" id="qq-write">确认写入 QQ</button></div>
+      </section>
+
+      <section class="settings-panel" id="settings-panel" hidden>
+        <section class="settings-card">
+          <div class="settings-card-head">
+            <span class="settings-card-title">模型服务</span>
+            <span class="settings-card-sub">闲聊与重任务都由它驱动；重任务引擎会用同一份配置</span>
+          </div>
+          <div class="settings-field">
+            <label for="backend-select">接入方式</label>
+            <select id="backend-select">
+              <option value="cloud">云端 API（OpenAI / DeepSeek 等，推荐，能力最强）</option>
+              <option value="local">本地小模型（离线运行，隐私优先、能力有限）</option>
+            </select>
+          </div>
+          <div class="settings-field" data-cloud-only>
+            <label for="provider-preset">服务商快选</label>
+            <select id="provider-preset">
+              <option value="">保持不变</option>
+              <option value="deepseek">DeepSeek</option>
+              <option value="dashscope">通义千问</option>
+              <option value="openai">OpenAI</option>
+            </select>
+          </div>
+          <div class="settings-field" data-cloud-only>
+            <label for="endpoint-input">接口地址（Endpoint）</label>
+            <input id="endpoint-input" type="url" placeholder="https://api.openai.com" />
+          </div>
+          <div class="settings-field" data-cloud-only>
+            <label for="model-input">模型名（Model）</label>
+            <input id="model-input" type="text" placeholder="gpt-4o-mini" />
+          </div>
+          <div class="settings-field" data-cloud-only>
+            <label for="api-key-input">API Key <span class="settings-badge" id="key-status">未配置</span></label>
+            <input id="api-key-input" type="password" autocomplete="off" placeholder="留空 = 不修改已保存的密钥" />
+          </div>
+          <label class="remember-key"><input id="remember-api-key" type="checkbox" /> 用 Windows DPAPI 加密记住密钥（否则仅本次运行有效）</label>
+          <p class="settings-note" id="key-note">密钥只保存在本机；勾选后由当前 Windows 账户加密存储，不会写入明文配置。</p>
+          <button class="btn primary" id="save-settings">保存模型设置</button>
+        </section>
+
+        <section class="settings-card">
+          <div class="settings-card-head">
+            <span class="settings-card-title">桌宠</span>
+            <span class="settings-card-sub">进度控制台：右键菜单打开工作台 / 快捷审批 / 中止任务</span>
+          </div>
+          <div class="settings-field">
+            <label>气泡文案（留空 = 用默认）</label>
+            <div class="bubble-grid">
+              <label>待机<input id="bubble-idle" type="text" maxlength="16" placeholder="灵犀" /></label>
+              <label>思考<input id="bubble-thinking" type="text" maxlength="16" placeholder="思考中…" /></label>
+              <label>发言<input id="bubble-speaking" type="text" maxlength="16" placeholder="建议好了" /></label>
+              <label>提醒<input id="bubble-alert" type="text" maxlength="16" placeholder="等你审批" /></label>
+            </div>
+          </div>
+          <label class="remember-key"><input id="pet-visible" type="checkbox" checked /> 在桌面显示桌宠</label>
+          <button class="btn ghost" id="save-pet-options">保存桌宠设置</button>
+        </section>
+
+        <section class="settings-card">
+          <div class="settings-card-head">
+            <span class="settings-card-title">重任务引擎</span>
+            <span class="settings-card-sub">读写文件、跑命令、多步干活都靠它</span>
+          </div>
+          <div class="settings-field">
+            <label for="engine-workspace">工作文件夹（它只能读写这里面的内容）</label>
+            <div class="engine-workspace-row">
+              <input id="engine-workspace" type="text" placeholder="留空 = 文档目录" />
+              <button class="mini-btn" id="engine-pick-folder" type="button">选择…</button>
+            </div>
+          </div>
+          <div class="settings-field">
+            <label for="engine-port">服务端口</label>
+            <input id="engine-port" type="number" min="1" max="65535" placeholder="4096" />
+          </div>
+          <div class="settings-field">
+            <label for="engine-exe">引擎程序（owo-agent.exe；留空 = 自动探测：同目录 &gt; resources 子目录）</label>
+            <div class="engine-workspace-row">
+              <input id="engine-exe" type="text" placeholder="自动探测 / 手动选择" />
+              <button class="mini-btn" id="engine-pick-exe" type="button">选择…</button>
+            </div>
+          </div>
+          <label class="remember-key"><input id="engine-auto-start" type="checkbox" /> 桌宠启动时自动拉起引擎</label>
+          <p class="settings-note" id="engine-model-note">引擎复用上方「模型服务」的 API 配置（支持 OpenAI 及兼容端点）。改动模型或工作文件夹后，点「重启引擎」生效。</p>
+          <div class="engine-actions">
+            <button class="btn primary" id="engine-restart">重启引擎</button>
+            <button class="btn ghost" id="save-engine-options">保存引擎设置</button>
+            <button class="btn ghost" id="engine-stop" title="停止由灵犀托管的引擎进程（手动启动的服务不受影响）">停止引擎</button>
+          </div>
+          <p class="settings-note" id="engine-status-inline"></p>
+        </section>
+
+        <section class="settings-card">
+          <div class="settings-card-head">
+            <span class="settings-card-title">权限规则</span>
+            <span class="settings-card-sub">审批卡里记住的授权，可随时撤销</span>
+            <button class="mini-btn" id="perm-rules-refresh" type="button">刷新</button>
+          </div>
+          <div class="perm-rules-list" id="perm-rules-list" aria-live="polite"></div>
+          <p class="settings-note">「总是允许」写入本机配置长期生效；「本会话内允许」重启引擎后失效。危险命令（如 rm -rf）永远无法被记住。</p>
+        </section>
+
+        <section class="settings-card">
+          <div class="settings-card-head">
+            <span class="settings-card-title">定时任务</span>
+            <span class="settings-card-sub">到点自动跑只读任务或弹提醒，执行记录可查</span>
+            <button class="mini-btn" id="auto-refresh" type="button">刷新</button>
+          </div>
+          <div class="auto-list" id="auto-list" aria-live="polite"></div>
+          <div class="auto-form">
+            <div class="auto-form-row">
+              <input id="auto-name" type="text" placeholder="任务名（如：每日仓库巡检）" maxlength="40" />
+              <select id="auto-schedule">
+                <option value="daily">每天</option>
+                <option value="interval">每隔</option>
+              </select>
+              <input id="auto-time" type="time" value="09:00" />
+              <input id="auto-every" type="number" min="1" max="1440" value="60" hidden />
+              <span class="settings-note" id="auto-every-unit" hidden>分钟</span>
+            </div>
+            <div class="auto-form-row">
+              <select id="auto-kind">
+                <option value="prompt">跑任务（只读分析）</option>
+                <option value="reminder">提醒</option>
+              </select>
+              <input id="auto-content" type="text" placeholder="任务指令（如：检查 git 状态并总结改动）或提醒内容" maxlength="500" />
+              <button class="btn primary" id="auto-create" type="button">添加</button>
+            </div>
+          </div>
+          <p class="settings-note">「跑任务」到点自动执行一个只读 Agent 回合（可读文件/搜索/git 查看，不能写入或执行命令——无人在场不能授权）；结果在任务的「执行记录」里查看。任务在引擎运行期间生效。</p>
+        </section>
+
+        <section class="settings-card">
+          <div class="settings-card-head">
+            <span class="settings-card-title">窗口行为与快捷键</span>
+          </div>
+          <label class="remember-key"><input id="panel-auto-hide" type="checkbox" checked /> 切到其他应用时自动收起面板</label>
+          <label class="remember-key"><input id="panel-remember-pos" type="checkbox" checked /> 记住面板位置（关闭则跟随光标出现）</label>
+          <div class="settings-field">
+            <label for="panel-hotkey">主面板呼出热键（组合语法，如 Ctrl+Alt+D；默认同左侧）</label>
+            <div class="engine-workspace-row">
+              <input id="panel-hotkey" type="text" placeholder="Ctrl+Alt+D" maxlength="40" />
+              <button class="mini-btn" id="save-panel-hotkey" type="button">保存</button>
+            </div>
+          </div>
+          <label class="remember-key"><input id="clipboard-watch" type="checkbox" checked /> 记录剪贴板历史（隐私开关：关闭后完全不读取剪贴板）</label>
+          <button class="btn ghost" id="save-window-options">保存窗口设置</button>
+        </section>
+      </section>
+
+      <section class="agent-view" id="agent-view">
+        <div class="mode-switch" id="mode-switch">
+          <div class="mode-seg" role="tablist" aria-label="对话模式">
+            <button class="mode-option is-active" id="mode-chat" role="tab">闲聊</button>
+            <button class="mode-option" id="mode-task" role="tab">
+              <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M13 2 3 14h7l-1 8 10-12h-7l1-8Z"/></svg>
+              重任务
+            </button>
+          </div>
+          <button class="mini-btn" id="agent-sessions-btn" title="历史会话">历史</button>
+          <button class="mini-btn" id="agent-reset" title="开始新对话">新对话</button>
+        </div>
+        <div class="engine-strip" id="mode-engine" hidden>
+          <span class="owo-dot" id="owo-dot" aria-hidden="true"></span>
+          <span class="owo-status-text" id="owo-status-text">引擎未连接</span>
+          <button class="mini-btn" id="owo-start" hidden>启动引擎</button>
+        </div>
+        <div class="sessions-panel" id="sessions-panel" hidden>
+          <div class="sessions-head">
+            <span>历史会话</span>
+            <button class="mini-btn" id="sessions-refresh" type="button">刷新</button>
+          </div>
+          <div class="sessions-list" id="sessions-list" aria-live="polite"></div>
+        </div>
+        <div class="chat-messages" id="chat-messages">
+          <div class="chat-empty">
+            <div class="chat-empty-title" id="chat-empty-title">和灵犀说话</div>
+            <div class="chat-empty-sub" id="chat-empty-sub">直接问，或让它帮你处理文字</div>
+            <div class="chat-suggestions" id="chat-suggestions"></div>
+          </div>
+        </div>
+        <div class="chat-input-area">
+          <button class="composer-plus" id="composer-plus" title="把剪贴板内容加入输入框" aria-label="从剪贴板添加内容">+</button>
+          <button class="composer-plus" id="chat-attach" title="添加图片（截图后也可直接 Ctrl+V，重任务模式下生效）" aria-label="添加图片">
+            <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><path d="m21 15-5-5L5 21"/></svg>
+          </button>
+          <textarea id="chat-input" placeholder="开始新对话…" rows="1"></textarea>
+          <button class="composer-send" id="chat-send" title="发送 (Ctrl+Enter)" aria-label="发送">
+            <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 19V5"/><path d="m5 12 7-7 7 7"/></svg>
+          </button>
+        </div>
+        <div class="chat-attach-bar" id="chat-attach-bar" hidden></div>
+        <input type="file" id="chat-file-pick" accept="image/png,image/jpeg,image/webp,image/gif" multiple hidden />
+        <div class="composer-tools">
+          <button class="composer-tool" id="tool-type" title="打字输入：聚焦输入框">
+            <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg>
+            打字
+          </button>
+          <span class="composer-divider" aria-hidden="true"></span>
+          <button class="composer-tool" id="tool-voice" title="语音输入：说出你的想法，自动转成文字">
+            <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 2a3 3 0 0 1 3 3v6a3 3 0 0 1-6 0V5a3 3 0 0 1 3-3Z"/><path d="M19 10v1a7 7 0 0 1-14 0v-1"/><path d="M12 18v4"/><path d="M8 22h8"/></svg>
+            语音
+          </button>
+        </div>
+      </section>
+
+      <section class="tools-view" id="tools-view" hidden>
+        <div class="quick-actions" id="quick-actions">
+        </div>
+        <div class="tools-toolbar">
+          <input class="tools-search" id="tools-search" type="search" placeholder="搜索 Agent 能力…" />
+          <span class="tools-count" id="tools-count" hidden>0</span>
+        </div>
+        <button class="market-banner" id="tools-market-btn" type="button" aria-label="打开插件市场">
+          <span class="market-banner-icon" aria-hidden="true"><svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="m7.5 4.27 9 5.15"/><path d="M21 8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16Z"/><path d="m3.3 7 8.7 5 8.7-5"/><path d="M12 22V12"/></svg></span>
+          <span class="market-banner-body">
+            <span class="market-banner-title">插件市场</span>
+            <span class="market-banner-desc">皮肤、小工具与新能力，集中在这里获取</span>
+          </span>
+          <span class="market-banner-badge">进入</span>
+          <span class="market-banner-tags" aria-hidden="true">
+            <span class="market-tag">皮肤包</span>
+            <span class="market-tag">小工具</span>
+            <span class="market-tag">新能力</span>
+          </span>
+        </button>
+        <div class="widgets-section" id="widgets-section">
+          <div class="widgets-section-head">
+            <span class="widgets-section-title">桌面小工具</span>
+            <span class="widgets-section-sub">点击打开独立窗口</span>
+          </div>
+          <div class="widgets-grid" id="widgets-grid"></div>
+        </div>
+        <div class="tools-section-head">
+          <span>Agent 能力</span>
+        </div>
+        <div class="tools-tabs" id="tools-tabs">
+          <button class="tools-tab is-active" data-cat="all">全部</button>
+          <button class="tools-tab" data-cat="capability">能力</button>
+          <button class="tools-tab" data-cat="adapter">应用</button>
+          <button class="tools-tab" data-cat="source">信息源</button>
+          <button class="tools-tab" data-cat="transform">变换</button>
+        </div>
+        <div class="tools-grid" id="tools-grid"></div>
+        <div class="tools-empty" id="tools-empty" hidden>未找到匹配的工具</div>
+      </section>
+
+      <section class="market-view" id="market-view" hidden>
+        <div class="market-toolbar">
+          <button class="market-back" id="market-back" type="button">
+            <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m15 18-6-6 6-6"/></svg>
+            返回
+          </button>
+          <span class="market-title">插件市场</span>
+          <button class="market-refresh" id="market-refresh" type="button">刷新</button>
+        </div>
+        <div class="market-tabs" id="market-tabs">
+          <button class="market-tab" data-tab="plugins">
+            <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M7 3.34V5a3 3 0 0 0 3 3"/><path d="M11 21.95V18a2 2 0 0 0-2-2 2 2 0 0 0-2 2v4"/><path d="M21.54 15H17a2 2 0 0 0-2 2 2 2 0 0 0 2 2h2"/><path d="M3 2v1c0 1 1 2 2 2h5a2 2 0 0 1 2 2 2 2 0 0 0 2 2 2 2 0 0 1 2 2 2 2 0 0 0 2 2h3"/><path d="M11 2h1a5 5 0 0 1 5 5v1a2 2 0 0 0 2 2h3"/></svg>
+            插件市场
+          </button>
+        </div>
+        <div class="market-error" id="market-error" hidden></div>
+        <div class="market-grid" id="market-grid"></div>
+        <div class="market-empty" id="market-empty" hidden>暂无可安装的工具插件</div>
+        <div class="market-empty" id="skins-empty" hidden>暂无可安装的皮肤</div>
+      </section>
+
+      <div class="status" id="status" hidden></div>
+
+      <footer class="actions" id="rewrite-actions" hidden>
+        <button class="btn ghost" id="undo-btn">撤销</button>
+        <button class="btn primary" id="apply-btn">
+          应用到文档 <kbd>Ctrl</kbd><kbd>Enter</kbd>
+        </button>
+      </footer>
+      <button class="resize-grip" id="resize-grip" title="拖动调整窗口大小" aria-label="拖动调整窗口大小"></button>
+    </main>
+
+    <!-- B4-3 首启引导：3 步完成配置；完成/跳过后写标记不再出现 -->
+    <div class="onboarding-mask" id="onboarding" hidden>
+      <div class="onboarding-card">
+        <div class="onboarding-title">欢迎使用灵犀</div>
+        <div class="onboarding-sub">3 步就绪，之后随时可在设置页调整</div>
+        <ol class="onboarding-steps">
+          <li>
+            <b>配置模型</b>：在「设置 → 模型服务」填入 API Key（DeepSeek / OpenAI 等兼容端点均可）。
+            <span class="onboarding-state" id="onboarding-key-state"></span>
+          </li>
+          <li>
+            <b>启动引擎</b>：重任务（读写文件、跑命令）依赖本地 owo-agent 引擎。
+            <span class="onboarding-state" id="onboarding-engine-state"></span>
+          </li>
+          <li>
+            <b>记住热键</b>：<code>Ctrl+Alt+Space</code> 划词改写；<code id="onboarding-hotkey">Ctrl+Alt+D</code> 呼出/收起主面板。
+          </li>
+        </ol>
+        <div class="onboarding-actions">
+          <button class="btn primary" id="onboarding-start-engine" type="button">启动引擎</button>
+          <button class="btn ghost" id="onboarding-settings" type="button">去配置模型</button>
+          <button class="btn ghost" id="onboarding-done" type="button">完成</button>
+        </div>
+      </div>
+    </div>
+
+    <script src="markdown.js"></script>
+    <script src="app.js"></script>
+  </body>
+</html>

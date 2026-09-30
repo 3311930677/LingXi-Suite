@@ -1,0 +1,12 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Permissions for the overlay window.",
+  "windows": ["main", "pet", "widget-ocr", "widget-translate", "widget-colorpicker", "widget-weather", "widget-calculator", "widget-clipboard"],
+  "permissions": [
+    "core:default",
+    "core:event:default",
+    "core:window:default",
+    "core:tray:default"
+  ]
+}

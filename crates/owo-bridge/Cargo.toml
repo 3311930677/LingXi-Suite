@@ -1,0 +1,13 @@
+[package]
+name = "owo-bridge"
+version = "0.1.0"
+edition = "2021"
+description = "HTTP/SSE client for the owo-agent execution engine (LingXi task runtime bridge)"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+# 与 overlay 保持一致：native-tls（Windows schannel），避免 rustls→ring 被
+# 系统应用程序控制策略拦截（os error 4551）。
+ureq = { version = "2", default-features = false, features = ["native-tls", "json"] }

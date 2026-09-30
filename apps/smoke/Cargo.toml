@@ -1,0 +1,18 @@
+[package]
+name = "smoke"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "smoke"
+path = "src/main.rs"
+
+[dependencies]
+assistant-core = { path = "../../crates/assistant-core" }
+assistant-windows = { path = "../../crates/assistant-windows" }
+windows = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_System_Threading",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+] }

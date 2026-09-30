@@ -1,0 +1,6 @@
+[toolchain]
+# Tauri on Windows must be built with the MSVC toolchain; the GNU toolchain
+# invokes dlltool for the windows-sys crates and fails. This nested file
+# overrides the workspace root's GNU pin only for the overlay subproject.
+channel = "stable-x86_64-pc-windows-msvc"
+components = ["rustfmt", "clippy"]

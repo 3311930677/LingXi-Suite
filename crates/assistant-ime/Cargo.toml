@@ -1,0 +1,7 @@
+[package]
+name = "assistant-ime"
+version.workspace = true
+edition.workspace = true
+description = "Pure-Rust pinyin input-method engine core: syllable segmentation, dictionary-backed candidate generation, and pluggable reranking"
+
+[dependencies]

@@ -1,0 +1,11 @@
+[package]
+name = "probe"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "probe"
+path = "src/main.rs"
+
+[dependencies]
+assistant-windows = { path = "../../crates/assistant-windows" }

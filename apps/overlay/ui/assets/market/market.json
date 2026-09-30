@@ -1,0 +1,87 @@
+{
+  "entries": [
+    {
+      "id": "lingxi-hamster-night",
+      "name": "仓鼠·夜色",
+      "author": "lingxi",
+      "version": "1.0.0",
+      "description": "基于默认仓鼠皮肤的演示包，用于验收下载与删除闭环",
+      "thumbnail": "http://127.0.0.1:8787/lingxi-hamster-night/idle.png",
+      "url": "http://127.0.0.1:8787/lingxi-hamster-night-1.0.0.zip",
+      "sha256": "46a4d7a0da9e336ce7fbd6361941bbeaed65197a3bf0b73bc55898b51997d4a3",
+      "size": 2035351
+    },
+    {
+      "id": "lingxi-tool-calc",
+      "kind": "tool",
+      "name": "数学计算",
+      "author": "lingxi",
+      "version": "1.0.0",
+      "description": "计算数学表达式。支持 + - * / % ^（幂）、括号、负号，以及常量 pi 和 e。例如：(1+2)*3^2",
+      "thumbnail": "http://127.0.0.1:8787/lingxi-tool-calc-thumb.svg",
+      "url": "http://127.0.0.1:8787/lingxi-tool-calc-1.0.0.zip",
+      "sha256": "86d2c07af356eddc0f80f71da2aaa9bf9acb576c49af34154b39152d65e0b57c",
+      "size": 1525
+    },
+    {
+      "id": "lingxi-tool-fetch",
+      "kind": "tool",
+      "name": "网页抓取",
+      "author": "lingxi",
+      "version": "1.0.0",
+      "description": "获取指定 URL 的网页内容，去除 HTML 标签后返回正文文本（截断到 2 万字符）。仅支持 http/https。",
+      "thumbnail": "http://127.0.0.1:8787/lingxi-tool-fetch-thumb.svg",
+      "url": "http://127.0.0.1:8787/lingxi-tool-fetch-1.0.0.zip",
+      "sha256": "cfc4f30f6be7f7f2eeee611aeeb9e813fc119243e6b02afe29882443ab0d3fa3",
+      "size": 1181
+    },
+    {
+      "id": "lingxi-tool-search",
+      "kind": "tool",
+      "name": "网页搜索",
+      "author": "lingxi",
+      "version": "1.0.0",
+      "description": "搜索网页并返回标题、链接和摘要。DuckDuckGo 优先，不可达时自动回退 Bing。",
+      "thumbnail": "http://127.0.0.1:8787/lingxi-tool-search-thumb.svg",
+      "url": "http://127.0.0.1:8787/lingxi-tool-search-1.0.0.zip",
+      "sha256": "e9b44ce833fa8a0979bb76d36d309ac5b211a6744cbd83bf796e65c27d2dd5c6",
+      "size": 1601
+    },
+    {
+      "id": "lingxi-tool-translate",
+      "kind": "tool",
+      "name": "文本翻译",
+      "author": "lingxi",
+      "version": "1.0.0",
+      "description": "翻译文本到目标语言，支持中英日韩法德，多后端自动回退，无需 API 密钥。",
+      "thumbnail": "http://127.0.0.1:8787/lingxi-tool-translate-thumb.svg",
+      "url": "http://127.0.0.1:8787/lingxi-tool-translate-1.0.0.zip",
+      "sha256": "85cd9aa5be7e29aca0da094c93489b1ccac30d0f83175dc1d65589c211430c34",
+      "size": 1638
+    },
+    {
+      "id": "lingxi-tool-reminder",
+      "kind": "tool",
+      "name": "定时提醒",
+      "author": "lingxi",
+      "version": "1.0.0",
+      "description": "设置定时提醒：指定到期时间戳或延迟秒数，到点后弹出系统通知。",
+      "thumbnail": "http://127.0.0.1:8787/lingxi-tool-reminder-thumb.svg",
+      "url": "http://127.0.0.1:8787/lingxi-tool-reminder-1.0.0.zip",
+      "sha256": "eb709353e9e1d40530d7bb7daf32c51740d31823de748550a49cec836b408daf",
+      "size": 1949
+    },
+    {
+      "id": "lingxi-tool-upper",
+      "kind": "tool",
+      "name": "文本大写",
+      "author": "lingxi",
+      "version": "1.0.0",
+      "description": "演示工具插件：把输入文本转成大写字母（python 脚本实现）",
+      "thumbnail": "http://127.0.0.1:8787/lingxi-tool-upper-thumb.svg",
+      "url": "http://127.0.0.1:8787/lingxi-tool-upper-1.0.0.zip",
+      "sha256": "62cb47a23e9f812eb399bc8f5a2f4e2bd79bfd6ddef621a311224cfed135e1c5",
+      "size": 738
+    }
+  ]
+}

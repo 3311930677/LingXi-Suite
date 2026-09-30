@@ -1,0 +1,10 @@
+[package]
+name = "ime-server"
+version.workspace = true
+edition.workspace = true
+description = "TCP IPC server for the LingXi IME engine — receives candidates from a librime filter plugin and returns AI-reranked results"
+
+[dependencies]
+assistant-ime = { path = "../../crates/assistant-ime" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

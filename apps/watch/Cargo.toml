@@ -1,0 +1,11 @@
+[package]
+name = "watch"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "watch"
+path = "src/main.rs"
+
+[dependencies]
+assistant-windows = { path = "../../crates/assistant-windows" }

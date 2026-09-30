@@ -1,0 +1,47 @@
+[package]
+name = "overlay"
+version = "0.1.0"
+edition = "2021"
+description = "LingXi floating overlay for the cross-app input assistant"
+
+# Standalone crate (excluded from the workspace): requires the MSVC toolchain
+# and WebView2 to build, unlike the GNU-based rest of the project.
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon", "protocol-asset"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+dirs = "5"
+assistant-core = { path = "../../crates/assistant-core" }
+assistant-windows = { path = "../../crates/assistant-windows" }
+assistant-inference = { path = "../../crates/assistant-inference" }
+lingxi-agent = { path = "../../crates/lingxi-agent" }
+owo-bridge = { path = "../../crates/owo-bridge" }
+# net：面板翻译小部件（widgets.rs）直接使用 builtin::translate 模块。
+# 六个信息类 Agent 工具已改为市场插件，不再经 tools-windows 注册。
+lingxi-tools = { path = "../../crates/tools", features = ["net"] }
+lingxi-tools-windows = { path = "../../crates/tools-windows" }
+tokio = { version = "1", features = ["rt-multi-thread", "time"] }
+base64 = "0.22"
+uuid = { version = "1", features = ["v4"] }
+futures = "0.3"
+# native-tls（Windows 走 schannel）：默认的 rustls 依赖 ring，其 C 构建脚本
+# 会被系统应用程序控制策略拦截（os error 4551），故显式切换实现。
+ureq = { version = "2", default-features = false, features = ["native-tls"] }
+# 原生文件夹选择对话框（选择重任务工作区）。
+rfd = "0.15"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+sha2 = "0.10"
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_Security_Cryptography",
+    "Win32_Graphics_Gdi",
+    "Win32_System_JobObjects",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Input_KeyboardAndMouse",
+] }

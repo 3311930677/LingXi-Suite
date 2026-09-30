@@ -1,0 +1,25 @@
+{
+  "id": "codex-cloud",
+  "name": "云朵机器人",
+  "author": "LingXi",
+  "version": "1.0.0",
+  "description": "Codex 风的蓝色云朵机器人：深色面罩里的终端符号随状态呼吸、跳动与提醒。",
+  "states": {
+    "idle": {
+      "image": "idle.svg",
+      "bubble": "在呢"
+    },
+    "thinking": {
+      "image": "thinking.svg",
+      "bubble": "干活中…"
+    },
+    "speaking": {
+      "image": "speaking.svg",
+      "bubble": "搞定"
+    },
+    "alert": {
+      "image": "alert.svg",
+      "bubble": "需要你确认"
+    }
+  }
+}

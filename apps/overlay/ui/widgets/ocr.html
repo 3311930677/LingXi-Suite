@@ -1,0 +1,238 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>屏幕识别 · 灵犀</title>
+<link rel="stylesheet" href="widget.css">
+<style>
+.canvas-wrap {
+  flex: 1 1 auto;
+  background: var(--surface);
+  border: 1px solid var(--stroke);
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 0;
+}
+canvas { max-width: 100%; max-height: 100%; cursor: crosshair; }
+.result-actions { display: flex; gap: 6px; flex: 0 0 auto; }
+.history-label { font-size: 11px; color: var(--text-faint); flex: 0 0 auto; }
+</style>
+</head>
+<body>
+<div class="widget-titlebar">
+  <div class="title">屏幕识别</div>
+  <button class="widget-close" id="widget-close" title="关闭 (Esc)">×</button>
+</div>
+<div class="widget-body">
+  <div class="toolbar">
+    <button class="btn btn-primary" id="capture-btn">截取屏幕</button>
+    <button class="btn btn-sm" id="save-btn" style="display:none">保存图片</button>
+    <span class="status" id="status"></span>
+  </div>
+  <div class="canvas-wrap" id="canvas-wrap">
+    <div class="placeholder" id="placeholder">点击「截取屏幕」开始<br>截好图后，在图片上拖拽框选要识别的区域</div>
+    <canvas id="canvas" style="display:none"></canvas>
+  </div>
+  <div class="result-box" id="result-text" style="display:none"></div>
+  <div class="result-actions" id="result-actions" style="display:none">
+    <button class="btn btn-sm" id="copy-btn">复制</button>
+    <button class="btn btn-sm" id="search-btn">搜索</button>
+  </div>
+  <div class="history-label" id="history-label" style="display:none">最近识别：</div>
+  <div class="item-grid" id="history"></div>
+</div>
+<script src="widget.js"></script>
+<script>
+"use strict";
+let screenshot = null;
+let screenshotData = null;
+let dispW = 0;
+let dispH = 0;
+let history = [];
+let isSelecting = false;
+let selStart = null;
+let selEnd = null;
+
+const el = {
+  captureBtn: document.getElementById("capture-btn"),
+  saveBtn: document.getElementById("save-btn"),
+  status: document.getElementById("status"),
+  canvasWrap: document.getElementById("canvas-wrap"),
+  placeholder: document.getElementById("placeholder"),
+  canvas: document.getElementById("canvas"),
+  resultText: document.getElementById("result-text"),
+  resultActions: document.getElementById("result-actions"),
+  copyBtn: document.getElementById("copy-btn"),
+  searchBtn: document.getElementById("search-btn"),
+  history: document.getElementById("history"),
+  historyLabel: document.getElementById("history-label"),
+};
+
+async function captureScreen() {
+  if (!invoke) { setStatus("需要 Tauri 环境", "err"); return; }
+  el.captureBtn.disabled = true;
+  setStatus("正在截取屏幕...");
+  try {
+    const result = await invoke("widget_capture_screen");
+    const img = new Image();
+    img.onload = () => {
+      screenshot = img;
+      screenshotData = result.image;
+      el.placeholder.style.display = "none";
+      el.canvas.style.display = "block";
+      const ctx = el.canvas.getContext("2d");
+      const dpr = window.devicePixelRatio || 1;
+      const maxW = el.canvasWrap.clientWidth - 20;
+      const maxH = el.canvasWrap.clientHeight - 20;
+      const scale = Math.min(maxW / img.width, maxH / img.height, 1);
+      dispW = Math.max(1, Math.round(img.width * scale));
+      dispH = Math.max(1, Math.round(img.height * scale));
+      // 高分屏下按 DPR 渲染，否则预览图是模糊的（内部像素不足）
+      el.canvas.width = dispW * dpr;
+      el.canvas.height = dispH * dpr;
+      el.canvas.style.width = dispW + "px";
+      el.canvas.style.height = dispH + "px";
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      ctx.drawImage(img, 0, 0, dispW, dispH);
+      el.saveBtn.style.display = "inline-block";
+      setStatus("在图片上拖拽框选要识别的区域");
+      setupSelection();
+    };
+    img.src = result.image;
+  } catch(e) {
+    setStatus("截图失败: " + String(e), "err");
+  }
+  el.captureBtn.disabled = false;
+}
+
+function setupSelection() {
+  const ctx = el.canvas.getContext("2d");
+  el.canvas.onmousedown = (e) => {
+    isSelecting = true;
+    const rect = el.canvas.getBoundingClientRect();
+    selStart = { x: e.clientX - rect.left, y: e.clientY - rect.top };
+  };
+  el.canvas.onmousemove = (e) => {
+    if (!isSelecting || !screenshot) return;
+    const rect = el.canvas.getBoundingClientRect();
+    selEnd = { x: e.clientX - rect.left, y: e.clientY - rect.top };
+    ctx.drawImage(screenshot, 0, 0, dispW, dispH);
+    const x = Math.min(selStart.x, selEnd.x);
+    const y = Math.min(selStart.y, selEnd.y);
+    const w = Math.abs(selEnd.x - selStart.x);
+    const h = Math.abs(selEnd.y - selStart.y);
+    // 半透明遮罩
+    ctx.fillStyle = "rgba(0,0,0,.35)";
+    ctx.fillRect(0, 0, dispW, dispH);
+    // 清除选区显示原图
+    ctx.drawImage(screenshot, x / dispW * screenshot.width, y / dispH * screenshot.height, w / dispW * screenshot.width, h / dispH * screenshot.height, x, y, w, h);
+    // 选框边线
+    ctx.strokeStyle = "#4cc2ff";
+    ctx.lineWidth = 2;
+    ctx.setLineDash([6, 4]);
+    ctx.strokeRect(x, y, w, h);
+    ctx.setLineDash([]);
+    // 尺寸标签
+    if (w > 30 && h > 20) {
+      const scaleX = screenshot.width / dispW;
+      const scaleY = screenshot.height / dispH;
+      const label = Math.round(w * scaleX) + "×" + Math.round(h * scaleY);
+      ctx.fillStyle = "rgba(76,194,255,.9)";
+      ctx.fillRect(x, y - 18, ctx.measureText(label).width + 20, 16);
+      ctx.fillStyle = "#fff";
+      ctx.font = "11px sans-serif";
+      ctx.fillText(label, x + 6, y - 6);
+    }
+  };
+  el.canvas.onmouseup = async (e) => {
+    if (!isSelecting || !screenshot || !selEnd) { isSelecting = false; return; }
+    isSelecting = false;
+    const rect = el.canvas.getBoundingClientRect();
+    selEnd = { x: e.clientX - rect.left, y: e.clientY - rect.top };
+    const x = Math.min(selStart.x, selEnd.x);
+    const y = Math.min(selStart.y, selEnd.y);
+    const w = Math.abs(selEnd.x - selStart.x);
+    const h = Math.abs(selEnd.y - selStart.y);
+    if (w < 5 || h < 5) return;
+    const scaleX = screenshot.width / dispW;
+    const scaleY = screenshot.height / dispH;
+    await ocrRegion(Math.round(x * scaleX), Math.round(y * scaleY), Math.round(w * scaleX), Math.round(h * scaleY));
+  };
+}
+
+async function ocrRegion(x, y, w, h) {
+  setStatus("正在识别文字...");
+  el.resultText.style.display = "none";
+  el.resultActions.style.display = "none";
+  try {
+    const result = await invoke("widget_ocr", { x, y, w, h });
+    el.resultText.textContent = result.text || "(未识别到文字)";
+    el.resultText.style.display = "block";
+    el.resultActions.style.display = "flex";
+    setStatus("识别完成", "ok");
+    if (result.text) {
+      history.unshift(result.text.substring(0, 100));
+      history = history.slice(0, 5);
+      renderHistory();
+    }
+  } catch(e) {
+    setStatus("识别失败: " + String(e), "err");
+  }
+}
+
+function renderHistory() {
+  if (history.length === 0) {
+    el.history.innerHTML = "";
+    el.historyLabel.style.display = "none";
+    return;
+  }
+  el.historyLabel.style.display = "block";
+  el.history.innerHTML = "";
+  history.forEach((text, i) => {
+    const div = document.createElement("div");
+    div.className = "item-row";
+    div.textContent = text.substring(0, 60) + (text.length > 60 ? "..." : "");
+    div.onclick = () => {
+      el.resultText.textContent = history[i];
+      el.resultText.style.display = "block";
+      el.resultActions.style.display = "flex";
+    };
+    el.history.appendChild(div);
+  });
+}
+
+el.captureBtn.onclick = captureScreen;
+el.copyBtn.onclick = async () => {
+  try {
+    await writeClipboard(el.resultText.textContent);
+    setStatus("已复制到剪贴板", "ok");
+  } catch { setStatus("复制失败", "err"); }
+};
+el.searchBtn.onclick = () => {
+  const text = el.resultText.textContent.trim();
+  if (text) window.open("https://www.bing.com/search?q=" + encodeURIComponent(text));
+};
+el.saveBtn.onclick = async () => {
+  if (!screenshotData) return;
+  try {
+    const r = await invoke("widget_save_image", { dataUrl: screenshotData, name: shotName() });
+    setStatus("已保存：" + r.path, "ok");
+  } catch(e) {
+    setStatus("保存失败: " + String(e), "err");
+  }
+};
+
+function shotName() {
+  const d = new Date(), p = n => String(n).padStart(2, "0");
+  return `lingxi-screenshot-${d.getFullYear()}${p(d.getMonth()+1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`;
+}
+
+setupWidgetClose("widget-ocr");
+</script>
+</body>
+</html>

@@ -1,0 +1,43 @@
+# Excluded from the root workspace (see the root Cargo.toml), so version/edition
+# and shared deps are spelled out explicitly rather than inherited.
+[package]
+name = "assistant-inference"
+version = "0.1.0"
+edition = "2021"
+description = "On-device model text transformer (candle + Qwen2.5) implementing assistant-core::Transformer"
+
+[dependencies]
+assistant-core = { path = "../assistant-core" }
+lingxi-agent = { path = "../lingxi-agent" }
+lingxi-tools = { path = "../tools" }
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+async-trait = "0.1"
+tokio = { version = "1", features = ["rt"] }
+
+# Pure-Rust CPU inference stack. No cmake/C/C++ toolchain required, matching the
+# rest of this project. GPU/MKL/CUDA features are intentionally left off.
+candle-core = "0.8"
+candle-transformers = "0.8"
+
+# `default-features = false` drops `onig` (C oniguruma) and `esaxx_fast` (C++).
+# In tokenizers 0.20 the ONLY switch from the onig backend to the pure-Rust
+# `fancy-regex` one is the (misleadingly named) `unstable_wasm` feature, which
+# on native targets merely swaps the regex engine; its `getrandom/js` extra is
+# inert off-wasm. This keeps the Qwen tokenizer loading with zero C dependency.
+tokenizers = { version = "0.20", default-features = false, features = [
+    "unstable_wasm",
+] }
+
+# Minimal HTTPS client for fetching weights from the Hugging Face Hub on first
+# use. `native-tls` uses Windows SChannel (no OpenSSL, no `ring`, no C compiler),
+# unlike hf-hub's default rustls stack which pulls `ring`.
+#
+# NOTE: ureq's `native-tls` feature only ships the adapter; it is deliberately
+# never used automatically ("must be configured on the agent"). So we depend on
+# `native-tls` directly and inject `TlsConnector::new()` via `AgentBuilder`,
+# otherwise every HTTPS call fails with "no TLS backend is configured".
+ureq = { version = "2", default-features = false, features = ["native-tls", "gzip"] }
+native-tls = "0.2"
+dirs = "5"

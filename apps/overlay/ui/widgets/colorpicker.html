@@ -1,0 +1,189 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>取色器 · 灵犀</title>
+<link rel="stylesheet" href="widget.css">
+<style>
+.color-display {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  flex: 0 0 auto;
+}
+.color-swatch {
+  width: 56px;
+  height: 56px;
+  border-radius: var(--radius-sm);
+  border: 2px solid var(--stroke);
+  flex: 0 0 auto;
+}
+.color-values {
+  flex: 1 1 auto;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.color-value {
+  display: flex;
+  justify-content: space-between;
+  font: 12px Consolas, monospace;
+  padding: 3px 8px;
+  background: var(--surface);
+  border-radius: 4px;
+  cursor: pointer;
+  transition: background .12s;
+}
+.color-value:hover { background: var(--surface-hi); }
+.color-value .label { color: var(--text-faint); }
+.color-value .val { color: var(--text); }
+.palette-label { font-size: 11px; color: var(--text-faint); flex: 0 0 auto; }
+.palette {
+  display: flex;
+  gap: 4px;
+  flex-wrap: wrap;
+  flex: 0 0 auto;
+}
+.palette-color {
+  width: 24px;
+  height: 24px;
+  border-radius: 4px;
+  border: 1px solid var(--stroke);
+  cursor: pointer;
+  transition: transform .12s;
+}
+.palette-color:hover { transform: scale(1.15); }
+</style>
+</head>
+<body>
+<div class="widget-titlebar">
+  <div class="title">取色器</div>
+  <button class="widget-close" id="widget-close" title="关闭 (Esc)">×</button>
+</div>
+<div class="widget-body">
+  <div class="toolbar">
+    <button class="btn btn-primary" id="pick-btn">选取颜色</button>
+    <span class="status" id="status">点击按钮后在屏幕任意位置点击取色</span>
+  </div>
+  <div class="color-display">
+    <div class="color-swatch" id="swatch" style="background:#4cc2ff"></div>
+    <div class="color-values">
+      <div class="color-value" data-format="hex">
+        <span class="label">HEX</span><span class="val" id="val-hex">#4CC2FF</span>
+      </div>
+      <div class="color-value" data-format="rgb">
+        <span class="label">RGB</span><span class="val" id="val-rgb">76, 194, 255</span>
+      </div>
+      <div class="color-value" data-format="hsl">
+        <span class="label">HSL</span><span class="val" id="val-hsl">200°, 100%, 65%</span>
+      </div>
+    </div>
+  </div>
+  <div class="palette-label">历史色板（点击复制）：</div>
+  <div class="palette" id="palette"></div>
+</div>
+<script src="widget.js"></script>
+<script>
+"use strict";
+const el = {
+  pickBtn: document.getElementById("pick-btn"),
+  status: document.getElementById("status"),
+  swatch: document.getElementById("swatch"),
+  valHex: document.getElementById("val-hex"),
+  valRgb: document.getElementById("val-rgb"),
+  valHsl: document.getElementById("val-hsl"),
+  palette: document.getElementById("palette"),
+};
+let palette = [];
+
+function rgbToHex(r, g, b) {
+  return "#" + [r, g, b].map(v => v.toString(16).padStart(2, "0").toUpperCase()).join("");
+}
+function rgbToHsl(r, g, b) {
+  r /= 255; g /= 255; b /= 255;
+  const max = Math.max(r, g, b), min = Math.min(r, g, b);
+  let h, s, l = (max + min) / 2;
+  if (max === min) { h = s = 0; }
+  else {
+    const d = max - min;
+    s = l > 0.5 ? d / (2 - max - min) : d / (max + min);
+    switch(max) {
+      case r: h = (g - b) / d + (g < b ? 6 : 0); break;
+      case g: h = (b - r) / d + 2; break;
+      case b: h = (r - g) / d + 4; break;
+    }
+    h /= 6;
+  }
+  return [Math.round(h * 360), Math.round(s * 100), Math.round(l * 100)];
+}
+
+function updateColor(r, g, b) {
+  const hex = rgbToHex(r, g, b);
+  const [h, s, l] = rgbToHsl(r, g, b);
+  el.swatch.style.background = hex;
+  el.valHex.textContent = hex;
+  el.valRgb.textContent = r + ", " + g + ", " + b;
+  el.valHsl.textContent = h + "°, " + s + "%, " + l + "%";
+  // 加入色板
+  if (!palette.includes(hex)) {
+    palette.unshift(hex);
+    palette = palette.slice(0, 20);
+    renderPalette();
+  }
+}
+
+function renderPalette() {
+  el.palette.innerHTML = "";
+  palette.forEach(hex => {
+    const div = document.createElement("div");
+    div.className = "palette-color";
+    div.style.background = hex;
+    div.title = hex;
+    div.onclick = () => {
+      writeClipboard(hex).then(() => setStatus("已复制 " + hex, "ok")).catch(() => setStatus("复制失败", "err"));
+    };
+    el.palette.appendChild(div);
+  });
+}
+
+el.pickBtn.onclick = async () => {
+  if (!invoke) { setStatus("需要 Tauri 环境", "err"); return; }
+  el.pickBtn.disabled = true;
+  setStatus("取色中：移动鼠标，点击屏幕任意位置确认，Esc 取消");
+  try {
+    // 打开全屏取色窗口（放大镜 HUD），结果通过 color-picked 事件返回。
+    await invoke("widget_pick_color_lens");
+  } catch (e) {
+    setStatus(String(e), "err");
+    el.pickBtn.disabled = false;
+  }
+};
+
+// 取色结果 / 取消事件：由全屏取色窗口广播回来
+const TAURI_EV = window.__TAURI__ && window.__TAURI__.event;
+if (TAURI_EV) {
+  TAURI_EV.listen("color-picked", (event) => {
+    const { r, g, b } = event.payload;
+    updateColor(r, g, b);
+    setStatus("取色完成 " + r + "," + g + "," + b, "ok");
+    el.pickBtn.disabled = false;
+  }).catch(() => {});
+  TAURI_EV.listen("lens-cancelled", () => {
+    setStatus("已取消取色", "err");
+    el.pickBtn.disabled = false;
+  }).catch(() => {});
+}
+
+// 点击颜色值复制
+document.querySelectorAll(".color-value").forEach(row => {
+  row.onclick = () => {
+    const val = row.querySelector(".val").textContent;
+    writeClipboard(val).then(() => setStatus("已复制 " + val, "ok")).catch(() => setStatus("复制失败", "err"));
+  };
+});
+
+setupWidgetClose("widget-colorpicker");
+</script>
+</body>
+</html>

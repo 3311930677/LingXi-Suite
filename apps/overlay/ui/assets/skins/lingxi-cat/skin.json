@@ -1,0 +1,25 @@
+{
+  "id": "lingxi-cat",
+  "name": "灵犀橘猫",
+  "author": "LingXi",
+  "version": "1.0.0",
+  "description": "备选形象：一只好奇的橘猫，思考时抬爪托腮，提醒时竖耳前倾。",
+  "states": {
+    "idle": {
+      "image": "idle.png",
+      "bubble": "喵"
+    },
+    "thinking": {
+      "image": "thinking.png",
+      "bubble": "琢磨中…"
+    },
+    "speaking": {
+      "image": "speaking.png",
+      "bubble": "说完了喵"
+    },
+    "alert": {
+      "image": "alert.png",
+      "bubble": "有新消息喵"
+    }
+  }
+}

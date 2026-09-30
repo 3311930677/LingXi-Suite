@@ -1,0 +1,7 @@
+[toolchain]
+# Workspace (crates/* + apps/*) builds with the GNU toolchain. apps/overlay
+# overrides to MSVC via its nested rust-toolchain.toml (Tauri/WebView2 need
+# MSVC codegen). crates/assistant-inference is workspace-excluded (candle
+# codegen also requires MSVC here) — see the root Cargo.toml exclude comment.
+channel = "stable-x86_64-pc-windows-gnu"
+components = ["rustfmt", "clippy"]

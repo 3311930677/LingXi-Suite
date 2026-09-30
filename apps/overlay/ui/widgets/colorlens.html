@@ -1,0 +1,183 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>屏幕取色 · 灵犀</title>
+<style>
+  html, body {
+    margin: 0;
+    width: 100%;
+    height: 100%;
+    background: transparent;
+    overflow: hidden;
+    cursor: crosshair; /* 准星光标：取色模式的明确视觉标志 */
+    user-select: none;
+  }
+  /* 放大镜 HUD：跟随光标，显示 11×11 像素放大 + 实时颜色 */
+  .lens {
+    position: fixed;
+    left: 0;
+    top: 0;
+    width: 122px;
+    padding: 6px;
+    background: rgba(20, 20, 24, 0.94);
+    border: 1px solid rgba(255, 255, 255, 0.14);
+    border-radius: 10px;
+    box-shadow: 0 6px 24px rgba(0, 0, 0, 0.45);
+    color: #ececf0;
+    font: 11px/1.5 Consolas, "Segoe UI", monospace;
+    pointer-events: none;
+    will-change: transform;
+  }
+  .zoom-wrap {
+    position: relative;
+    width: 110px;
+    height: 110px;
+    border-radius: 6px;
+    overflow: hidden;
+    background:
+      linear-gradient(45deg, #2a2a30 25%, transparent 25%, transparent 75%, #2a2a30 75%),
+      linear-gradient(45deg, #2a2a30 25%, #1e1e23 25%, #1e1e23 75%, #2a2a30 75%);
+    background-size: 8px 8px;
+    background-position: 0 0, 4px 4px;
+  }
+  .zoom-wrap canvas {
+    display: block;
+    width: 110px;
+    height: 110px;
+    image-rendering: pixelated;
+  }
+  /* 中心准星 */
+  .ch-v { position: absolute; left: 50%; top: 6%; bottom: 6%; width: 1px; background: rgba(255, 255, 255, 0.7); }
+  .ch-h { position: absolute; top: 50%; left: 6%; right: 6%; height: 1px; background: rgba(255, 255, 255, 0.7); }
+  .ch-box {
+    position: absolute;
+    left: calc(50% - 5px);
+    top: calc(50% - 5px);
+    width: 10px;
+    height: 10px;
+    border: 1px solid rgba(255, 255, 255, 0.95);
+    box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.4);
+  }
+  .swatch { height: 7px; border-radius: 4px; margin-top: 6px; background: #666; }
+  .row { display: flex; justify-content: space-between; gap: 8px; margin-top: 5px; }
+  .hex { font-weight: 700; }
+  .rgb { color: #a4a4ae; }
+  .tip { color: #8b8b96; font-size: 10px; text-align: center; margin-top: 3px; }
+</style>
+</head>
+<body>
+<div class="lens" id="lens">
+  <div class="zoom-wrap">
+    <canvas id="zoom" width="11" height="11"></canvas>
+    <i class="ch-v"></i><i class="ch-h"></i><i class="ch-box"></i>
+  </div>
+  <div class="swatch" id="swatch"></div>
+  <div class="row"><span class="hex" id="hex">#------</span><span class="rgb" id="rgb"></span></div>
+  <div class="tip">点击取色 · Esc / 右键取消</div>
+</div>
+<script>
+"use strict";
+const TAURI = window.__TAURI__ || null;
+const invoke = TAURI && TAURI.core ? TAURI.core.invoke : null;
+
+const lensEl = document.getElementById("lens");
+const zoomCanvas = document.getElementById("zoom");
+const zctx = zoomCanvas.getContext("2d");
+const hexEl = document.getElementById("hex");
+const rgbEl = document.getElementById("rgb");
+const swatchEl = document.getElementById("swatch");
+
+let img = null;   // 进入取色时的屏幕截图（物理像素）
+let offCtx = null; // 离屏采样上下文
+let raf = 0;
+let lastEvent = null;
+
+// 逻辑坐标 → 截图物理像素
+function phys(cx, cy) {
+  return {
+    x: Math.max(0, Math.min(img.width - 1, Math.round((cx / window.innerWidth) * img.width))),
+    y: Math.max(0, Math.min(img.height - 1, Math.round((cy / window.innerHeight) * img.height))),
+  };
+}
+
+function rgbToHex(r, g, b) {
+  return "#" + [r, g, b].map(v => v.toString(16).padStart(2, "0").toUpperCase()).join("");
+}
+
+function update() {
+  raf = 0;
+  const e = lastEvent;
+  if (!e || !img) return;
+  const p = phys(e.clientX, e.clientY);
+  const d = offCtx.getImageData(p.x, p.y, 1, 1).data;
+  const hex = rgbToHex(d[0], d[1], d[2]);
+  hexEl.textContent = hex;
+  rgbEl.textContent = d[0] + "," + d[1] + "," + d[2];
+  swatchEl.style.background = hex;
+
+  // 放大镜：中心点周围 11×11 像素
+  const sx = Math.max(0, Math.min(img.width - 11, p.x - 5));
+  const sy = Math.max(0, Math.min(img.height - 11, p.y - 5));
+  zctx.imageSmoothingEnabled = false;
+  zctx.clearRect(0, 0, 11, 11);
+  zctx.drawImage(zoomCanvas._src, sx, sy, 11, 11, 0, 0, 11, 11);
+
+  // HUD 位置：光标右下，贴边翻转
+  const w = lensEl.offsetWidth, h = lensEl.offsetHeight;
+  let x = e.clientX + 20, y = e.clientY + 20;
+  if (x + w > window.innerWidth - 6) x = e.clientX - w - 20;
+  if (y + h > window.innerHeight - 6) y = e.clientY - h - 20;
+  lensEl.style.transform = "translate(" + x + "px," + y + "px)";
+}
+
+function onMove(e) {
+  lastEvent = e;
+  if (!raf) raf = requestAnimationFrame(update);
+}
+
+function onDown(e) {
+  if (e.button !== 0 || !img) return;
+  const p = phys(e.clientX, e.clientY);
+  const d = offCtx.getImageData(p.x, p.y, 1, 1).data;
+  invoke("widget_lens_pick", { r: d[0], g: d[1], b: d[2] }).catch(() => {});
+}
+
+function cancel() {
+  invoke("widget_lens_cancel").catch(() => {});
+}
+
+async function init() {
+  if (!invoke) { window.close(); return; }
+  try {
+    const url = await invoke("widget_lens_get_image");
+    await new Promise((resolve, reject) => {
+      img = new Image();
+      img.onload = resolve;
+      img.onerror = reject;
+      img.src = url;
+    });
+  } catch (_) {
+    cancel();
+    return;
+  }
+  const off = document.createElement("canvas");
+  off.width = img.width;
+  off.height = img.height;
+  offCtx = off.getContext("2d", { willReadFrequently: true });
+  offCtx.drawImage(img, 0, 0);
+  zoomCanvas._src = off;
+
+  document.body.addEventListener("mousemove", onMove);
+  document.body.addEventListener("mousedown", onDown);
+  document.body.addEventListener("contextmenu", (e) => { e.preventDefault(); cancel(); });
+  window.addEventListener("keydown", (e) => { if (e.key === "Escape") cancel(); });
+  // 先摆到屏幕中央，等第一次移动再跟随
+  lensEl.style.transform =
+    "translate(" + (window.innerWidth / 2 - 61) + "px," + (window.innerHeight / 2 - 90) + "px)";
+}
+
+init();
+</script>
+</body>
+</html>

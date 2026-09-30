@@ -1,0 +1,35 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/assistant-core",
+    "crates/assistant-ime",
+    "crates/assistant-windows",
+    "crates/tools",
+    "crates/lingxi-agent",
+    "crates/owo-bridge",
+    "apps/probe",
+    "apps/watch",
+    "apps/demo",
+    "apps/smoke",
+    "apps/ime-repl",
+    "apps/ime-server",
+]
+# These two require the MSVC toolchain to *codegen* (the GNU-only environment
+# here lacks `dlltool.exe`, which candle's transitive deps and WebView2 need at
+# link time). Excluding them keeps `cargo build/test` for the rest of the
+# workspace green under GNU; both are built under MSVC as the overlay's path
+# dependencies (`cargo run` in apps/overlay).
+exclude = ["apps/overlay", "crates/assistant-inference"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+
+[workspace.dependencies]
+windows = "0.58"
+thiserror = "1"
+anyhow = "1"
+async-trait = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }

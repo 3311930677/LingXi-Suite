@@ -1,0 +1,8 @@
+[package]
+name = "ime-repl"
+version.workspace = true
+edition.workspace = true
+description = "Interactive REPL/CLI demo for the assistant-ime pinyin engine"
+
+[dependencies]
+assistant-ime = { path = "../../crates/assistant-ime" }

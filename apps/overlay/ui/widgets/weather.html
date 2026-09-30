@@ -1,0 +1,184 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>天气 · 灵犀</title>
+<link rel="stylesheet" href="widget.css">
+<style>
+.current {
+  background: var(--surface);
+  border: 1px solid var(--stroke);
+  border-radius: var(--radius-sm);
+  padding: 20px 16px;
+  text-align: center;
+  flex: 0 0 auto;
+}
+.current .temp { font-size: 42px; font-weight: 200; line-height: 1.1; letter-spacing: 0.01em; }
+.current .icon { color: var(--brand-hi); display: flex; justify-content: center; }
+.current .desc { color: var(--text-dim); margin-top: 5px; font-size: 12.5px; }
+.current .city { color: var(--text-faint); font-size: 11px; margin-top: 3px; letter-spacing: 0.03em; }
+.current .details { display: flex; justify-content: center; gap: 18px; margin-top: 12px; padding-top: 11px; border-top: 1px solid var(--stroke); font-size: 11.5px; color: var(--text-dim); }
+.forecast { display: flex; gap: 6px; flex: 0 0 auto; }
+.forecast-day {
+  flex: 1;
+  background: var(--surface);
+  border: 1px solid var(--stroke);
+  border-radius: var(--radius-sm);
+  padding: 10px 6px 9px;
+  text-align: center;
+}
+.forecast-day:first-child { border-color: rgba(76, 194, 255, 0.35); }
+.forecast-day .day { font-size: 10.5px; color: var(--text-faint); letter-spacing: 0.04em; }
+.forecast-day:first-child .day { color: var(--brand); font-weight: 600; }
+.forecast-day .date { font-size: 9.5px; color: var(--text-faint); margin-top: 1px; opacity: .8; }
+.forecast-day .icon { color: var(--text-dim); margin: 5px 0 4px; display: flex; justify-content: center; }
+.forecast-day .temps { font-size: 11.5px; font-variant-numeric: tabular-nums; }
+.forecast-day .high { color: #ff99a4; }
+.forecast-day .low { color: #99dcff; }
+.updated-at { text-align: center; font-size: 10px; color: var(--text-faint); flex: 0 0 auto; opacity: .85; }
+#content { flex: 1 1 auto; display: flex; flex-direction: column; gap: 10px; min-height: 0; }
+</style>
+</head>
+<body>
+<div class="widget-titlebar">
+  <div class="title">天气</div>
+  <button class="widget-close" id="widget-close" title="关闭 (Esc)">×</button>
+</div>
+<div class="widget-body">
+  <div class="toolbar">
+    <input type="text" id="city-input" placeholder="城市名（留空自动定位）" style="flex:1">
+    <button class="btn btn-primary btn-sm" id="refresh">查询</button>
+  </div>
+  <div class="placeholder" id="loading"><span class="spinner"></span> 正在获取天气...</div>
+  <div id="content" style="display:none">
+    <div class="current">
+      <div class="icon" id="w-icon"></div>
+      <div class="temp" id="w-temp">--°</div>
+      <div class="desc" id="w-desc">--</div>
+      <div class="city" id="w-city"></div>
+      <div class="details">
+        <span>湿度 <span id="w-humidity">--%</span></span>
+        <span>风速 <span id="w-wind">-- km/h</span></span>
+      </div>
+    </div>
+    <div class="forecast" id="forecast"></div>
+    <div class="updated-at" id="updated-at"></div>
+  </div>
+</div>
+<script src="widget.js"></script>
+<script>
+"use strict";
+const el = {
+  cityInput: document.getElementById("city-input"),
+  refresh: document.getElementById("refresh"),
+  loading: document.getElementById("loading"),
+  content: document.getElementById("content"),
+  wIcon: document.getElementById("w-icon"),
+  wTemp: document.getElementById("w-temp"),
+  wDesc: document.getElementById("w-desc"),
+  wCity: document.getElementById("w-city"),
+  wHumidity: document.getElementById("w-humidity"),
+  wWind: document.getElementById("w-wind"),
+  forecast: document.getElementById("forecast"),
+};
+
+// 线性描边天气图标（与主面板图标系统同风格），currentColor 继承容器颜色。
+const wIcon = (d, size = 30) =>
+  '<svg viewBox="0 0 24 24" width="' + size + '" height="' + size + '" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' + d + "</svg>";
+
+const PATHS = {
+  sun: '<circle cx="12" cy="12" r="4"/><path d="M12 2v2"/><path d="M12 20v2"/><path d="m4.93 4.93 1.41 1.41"/><path d="m17.66 17.66 1.41 1.41"/><path d="M2 12h2"/><path d="M20 12h2"/><path d="m6.34 17.66-1.41 1.41"/><path d="m19.07 4.93-1.41 1.41"/>',
+  cloudSun: '<path d="M12 2v2"/><path d="m4.93 4.93 1.41 1.41"/><path d="M20 12h2"/><path d="m19.07 4.93-1.41 1.41"/><path d="M15.947 12.65a4 4 0 0 0-5.925-4.128"/><path d="M13 22H7a5 5 0 1 1 4.9-6H13a3 3 0 0 1 0 6Z"/>',
+  cloud: '<path d="M17.5 19H9a7 7 0 1 1 6.71-9h1.79a4.5 4.5 0 1 1 0 9Z"/>',
+  fog: '<path d="M4 14.899A7 7 0 1 1 15.71 8h1.79a4.5 4.5 0 0 1 2.5 8.242"/><path d="M16 17H7"/><path d="M17 21H9"/>',
+  drizzle: '<path d="M4 14.899A7 7 0 1 1 15.71 8h1.79a4.5 4.5 0 0 1 2.5 8.242"/><path d="M8 19v1"/><path d="M8 14v1"/><path d="M16 19v1"/><path d="M16 14v1"/><path d="M12 21v1"/><path d="M12 16v1"/>',
+  rain: '<path d="M4 14.899A7 7 0 1 1 15.71 8h1.79a4.5 4.5 0 0 1 2.5 8.242"/><path d="M16 14v6"/><path d="M8 14v6"/><path d="M12 16v6"/>',
+  snow: '<path d="M4 14.899A7 7 0 1 1 15.71 8h1.79a4.5 4.5 0 0 1 2.5 8.242"/><path d="M8 15h.01"/><path d="M8 19h.01"/><path d="M12 17h.01"/><path d="M12 21h.01"/><path d="M16 15h.01"/><path d="M16 19h.01"/>',
+  storm: '<path d="M6 16.326A7 7 0 1 1 15.71 8h1.79a4.5 4.5 0 0 1 .5 8.973"/><path d="m13 12-3 5h4l-3 5"/>',
+  therm: '<path d="M14 4v10.54a4 4 0 1 1-4 0V4a2 2 0 0 1 4 0Z"/>',
+};
+
+const WEATHER_ICONS = {
+  0: PATHS.sun, 1: PATHS.sun, 2: PATHS.cloudSun, 3: PATHS.cloud,
+  45: PATHS.fog, 48: PATHS.fog,
+  51: PATHS.drizzle, 53: PATHS.drizzle, 55: PATHS.drizzle,
+  56: PATHS.drizzle, 57: PATHS.drizzle,
+  61: PATHS.rain, 63: PATHS.rain, 65: PATHS.rain,
+  66: PATHS.rain, 67: PATHS.rain,
+  71: PATHS.snow, 73: PATHS.snow, 75: PATHS.snow, 77: PATHS.snow,
+  80: PATHS.rain, 81: PATHS.rain, 82: PATHS.rain,
+  85: PATHS.snow, 86: PATHS.snow,
+  95: PATHS.storm, 96: PATHS.storm, 99: PATHS.storm,
+};
+
+const WEEKDAYS = ["周日", "周一", "周二", "周三", "周四", "周五", "周六"];
+
+// 把预报日期转成“今天 / 明天 / 后天 / 周X”+ MM-DD 日期
+function describeDate(dateStr, index) {
+  const label = index === 0 ? "今天" : index === 1 ? "明天" : index === 2 ? "后天" : null;
+  let dateText = dateStr ? dateStr.substring(5).replace("-", "/") : "";
+  let weekday = "";
+  if (dateStr) {
+    const d = new Date(dateStr + "T00:00:00");
+    if (!isNaN(d)) weekday = WEEKDAYS[d.getDay()];
+  }
+  return { label: label || weekday, dateText };
+}
+
+async function loadWeather() {
+  const city = el.cityInput.value.trim();
+  el.loading.innerHTML = '<span class="spinner"></span> ' + (city ? "正在查询 " + city + " ..." : "正在获取天气...");
+  el.loading.style.display = "block";
+  el.loading.style.color = "var(--text-faint)";
+  el.content.style.display = "none";
+  el.refresh.disabled = true;
+  try {
+    const data = await invoke("widget_get_weather", { city: city || null });
+    const cur = data.current;
+    el.wIcon.innerHTML = wIcon(WEATHER_ICONS[cur.weather_code] || PATHS.therm, 34);
+    el.wTemp.innerHTML = Math.round(cur.temperature) + '<span style="font-size:20px;color:var(--text-dim)">°C</span>';
+    el.wDesc.textContent = cur.description;
+    el.wCity.textContent = data.city && data.city !== "未知" ? data.city : "";
+    el.wHumidity.textContent = cur.humidity + "%";
+    el.wWind.textContent = cur.wind_speed.toFixed(1) + " km/h";
+
+    el.forecast.innerHTML = "";
+    const daily = data.daily || [];
+    daily.forEach((d, i) => {
+      const day = document.createElement("div");
+      day.className = "forecast-day";
+      const info = describeDate(d.date, i);
+      day.innerHTML = '<div class="day">' + info.label + '</div>'
+        + '<div class="date">' + info.dateText + '</div>'
+        + '<div class="icon">' + wIcon(WEATHER_ICONS[d.weather_code] || PATHS.therm, 22) + '</div>'
+        + '<div class="temps"><span class="high">' + Math.round(d.max) + '°</span><span class="sep" style="opacity:.4"> / </span><span class="low">' + Math.round(d.min) + '°</span></div>';
+      el.forecast.appendChild(day);
+    });
+
+    const now = new Date();
+    const timeStr = String(now.getHours()).padStart(2, "0") + ":" + String(now.getMinutes()).padStart(2, "0");
+    document.getElementById("updated-at").textContent = "更新于 " + timeStr;
+
+    el.loading.style.display = "none";
+    el.content.style.display = "flex";
+  } catch(e) {
+    el.loading.innerHTML = "获取天气失败：" + String(e)
+      + '<br><button class="btn btn-sm" style="margin-top:10px" onclick="loadWeather()">重试</button>';
+    el.loading.style.color = "var(--err)";
+  } finally {
+    el.refresh.disabled = false;
+  }
+}
+
+el.refresh.onclick = loadWeather;
+el.cityInput.addEventListener("keydown", (e) => {
+  if (e.key === "Enter") loadWeather();
+});
+
+setupWidgetClose("widget-weather");
+// 自动加载
+if (invoke) loadWeather();
+</script>
+</body>
+</html>

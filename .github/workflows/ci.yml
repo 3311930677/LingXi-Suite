@@ -1,0 +1,89 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  workspace:
+    name: Workspace
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable-x86_64-pc-windows-msvc
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: . -> target
+      - name: Format check
+        run: cargo fmt --all -- --check
+      - name: Test workspace
+        run: cargo test --workspace --locked
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+  inference:
+    name: Inference
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable-x86_64-pc-windows-msvc
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates/assistant-inference -> target
+      - name: Test inference and function calling
+        run: cargo test --manifest-path crates/assistant-inference/Cargo.toml --locked
+      - name: Clippy inference
+        run: cargo clippy --manifest-path crates/assistant-inference/Cargo.toml --all-targets --locked -- -D warnings
+
+  overlay:
+    name: Overlay
+    runs-on: windows-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable-x86_64-pc-windows-msvc
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: apps/overlay -> target
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Format check
+        run: cargo fmt --manifest-path apps/overlay/Cargo.toml -- --check
+      - name: Test overlay
+        run: cargo test --manifest-path apps/overlay/Cargo.toml --locked
+      - name: Clippy overlay
+        run: cargo clippy --manifest-path apps/overlay/Cargo.toml --all-targets --locked -- -D warnings
+      - name: Check frontend JavaScript
+        shell: pwsh
+        run: |
+          Get-ChildItem apps/overlay/ui/*.js | ForEach-Object {
+            node --check $_.FullName
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+      - name: Build release overlay
+        run: cargo build --manifest-path apps/overlay/Cargo.toml --release --locked

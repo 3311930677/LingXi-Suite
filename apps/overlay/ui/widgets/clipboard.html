@@ -1,0 +1,154 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>剪贴板历史 · 灵犀</title>
+<link rel="stylesheet" href="widget.css">
+<style>
+.clip-list {
+  flex: 1 1 auto;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-height: 0;
+}
+.clip-list::-webkit-scrollbar { width: 6px; }
+.clip-list::-webkit-scrollbar-thumb { background: var(--stroke); border-radius: 6px; }
+.clip-item {
+  padding: 8px 10px;
+  background: var(--surface);
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  transition: border-color .12s, background .12s;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.clip-item:hover { border-color: var(--brand); background: var(--surface-hi); }
+.clip-item .text {
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text);
+}
+.clip-item .meta {
+  font-size: 10px;
+  color: var(--text-faint);
+  display: flex;
+  justify-content: space-between;
+}
+.clip-item .del {
+  color: var(--text-faint);
+  cursor: pointer;
+  padding: 0 4px;
+}
+.clip-item .del:hover { color: var(--err); }
+</style>
+</head>
+<body>
+<div class="widget-titlebar">
+  <div class="title">剪贴板历史</div>
+  <button class="widget-close" id="widget-close" title="关闭 (Esc)">×</button>
+</div>
+<div class="widget-body">
+  <div class="toolbar">
+    <input type="search" id="search" placeholder="搜索剪贴板…" style="flex:1">
+    <button class="btn btn-sm" id="clear-btn">清空</button>
+    <span class="status" id="status"></span>
+  </div>
+  <div class="clip-list" id="clip-list">
+    <div class="placeholder">暂无记录<br>复制内容会自动出现在这里</div>
+  </div>
+</div>
+<script src="widget.js"></script>
+<script>
+"use strict";
+const el = {
+  search: document.getElementById("search"),
+  clearBtn: document.getElementById("clear-btn"),
+  status: document.getElementById("status"),
+  clipList: document.getElementById("clip-list"),
+};
+let clipCache = [];
+
+async function loadClipboard() {
+  if (!invoke) return;
+  try {
+    clipCache = await invoke("widget_clipboard_history");
+    renderClipboard();
+  } catch(e) {
+    setStatus("加载失败: " + String(e), "err");
+  }
+}
+
+function renderClipboard() {
+  const q = el.search.value.trim().toLowerCase();
+  const filtered = q ? clipCache.filter(c => c.text.toLowerCase().includes(q)) : clipCache;
+  el.clipList.innerHTML = "";
+  if (filtered.length === 0) {
+    el.clipList.innerHTML = '<div class="placeholder">' + (q ? "未找到匹配的记录" : "暂无记录<br>复制内容会自动出现在这里") + '</div>';
+    return;
+  }
+  filtered.forEach((item) => {
+    const div = document.createElement("div");
+    div.className = "clip-item";
+    const text = document.createElement("div");
+    text.className = "text";
+    text.textContent = item.text.substring(0, 80) + (item.text.length > 80 ? "..." : "");
+    const meta = document.createElement("div");
+    meta.className = "meta";
+    const time = document.createElement("span");
+    time.textContent = item.time;
+    const del = document.createElement("span");
+    del.className = "del";
+    del.textContent = "✕";
+    del.onclick = (e) => {
+      e.stopPropagation();
+      if (invoke) {
+        invoke("widget_clipboard_remove", { text: item.text }).then(() => {
+          clipCache = clipCache.filter(c => c !== item);
+          renderClipboard();
+          setStatus("已删除", "ok");
+        }).catch(err => setStatus("删除失败: " + String(err), "err"));
+      } else {
+        clipCache = clipCache.filter(c => c !== item);
+        renderClipboard();
+      }
+    };
+    meta.append(time, del);
+    div.append(text, meta);
+    div.onclick = () => {
+      if (invoke) {
+        invoke("widget_clipboard_write", { text: item.text }).then(() => {
+          setStatus("已写入剪贴板", "ok");
+        }).catch(e => setStatus("写入失败: " + String(e), "err"));
+      } else {
+        navigator.clipboard.writeText(item.text).then(() => setStatus("已复制", "ok"));
+      }
+    };
+    el.clipList.appendChild(div);
+  });
+}
+
+el.search.addEventListener("input", renderClipboard);
+el.clearBtn.onclick = async () => {
+  if (!invoke) return;
+  try {
+    await invoke("widget_clipboard_clear");
+    clipCache = [];
+    renderClipboard();
+    setStatus("已清空", "ok");
+  } catch(e) { setStatus("清空失败: " + String(e), "err"); }
+};
+
+// 系统剪贴板由后端监听线程写入历史，前端只需定期刷新展示。
+setupWidgetClose("widget-clipboard");
+loadClipboard();
+setInterval(loadClipboard, 2000);
+</script>
+</body>
+</html>

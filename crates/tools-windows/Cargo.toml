@@ -1,0 +1,28 @@
+[package]
+name = "lingxi-tools-windows"
+version.workspace = true
+edition.workspace = true
+description = "Windows platform tool implementations for the LingXi agent"
+
+[dependencies]
+# 六个信息类工具（含 web_fetch/translate）已改为市场插件，不再需要 net feature。
+lingxi-tools = { path = "../tools" }
+assistant-windows = { path = "../assistant-windows" }
+assistant-core = { path = "../assistant-core" }
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Input_KeyboardAndMouse",
+] }
+png = "0.17"
+base64 = "0.22"
+
+[dev-dependencies]
+tokio = { workspace = true }

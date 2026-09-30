@@ -1,0 +1,1 @@
+{"default":{"identifier":"default","description":"Permissions for the overlay window.","local":true,"windows":["main","pet","widget-ocr","widget-translate","widget-colorpicker","widget-weather","widget-calculator","widget-clipboard"],"permissions":["core:default","core:event:default","core:window:default","core:tray:default"]}}
