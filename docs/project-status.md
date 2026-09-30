@@ -5,6 +5,25 @@
 
 ## 一、当前进度总览
 
+### 2026-09-30 收尾 10：桌宠改造完成（定位=agent 显示工具板块，阶段1-4 全量落地）
+
+**阶段1 免构建迭代（核心痛点解决）**：
+- 引擎新增 `/pet`（桌宠页面）与 `/pet-assets`（皮肤资产）静态路由：环境变量 `OWO_PET_UI_DIR` / `OWO_PET_ASSETS_DIR` 指向桌面端 overlay 的 `ui/pet` 与 `ui/assets`（未设置回落 `desktop/web/pet`）；磁盘直读 + 全局 no-store → **改桌宠前端只碰磁盘文件，刷新窗口即生效，零 cargo build**。
+- overlay 的 pet 窗口加载本地 `pet-boot.html`（"连接引擎中"引导页）；pet-sync worker（2.5s）探测引擎：在线 → `navigate("/pet/index.html")`，离线 → 回 boot 页。remote capability（`pet-remote.json`，`http://127.0.0.1:*`）授权远程页面 IPC（拖动/审批/中止 10 个原生命令照常走 invoke）。
+- `skin_file_url` 改根相对路径 `/pet-assets/skins/<id>/<file>`；托管引擎时注入两个 env（exe 旁 ui/ 目录优先，编译期路径兜底）；`prepare-engine-dist.ps1` 复制前自动停掉运行中的引擎（解锁 os error 32）。
+- **实测**：`/pet/index.html` 200、皮肤图 200（218KB）；改 index.html 加标记 → HTTP 响应立即变化（全程未编译）。
+
+**阶段2 定位瘦身（桌宠=显示板块）**：
+- 删除 7 个 Rust 模块：`widgets`(45KB 小工具/剪贴板监听)、`market`(28KB)、`rewrite`(10KB)、`qq`、`agent`(本地 GGUF 推理)、`secret_store`、`hotkeys`；`panel.rs` 只留非激活样式/拖动/退出；`settings.rs` 收敛为桌宠+引擎桥配置（模型凭据归引擎侧 settings.json，OPENAI_* 注入移除）；主面板窗口与前端（index.html/app.js/styles.css 等 -213KB）退役，托盘只留桌宠显隐/工作台/退出。
+- overlay 编译 **28.4s → 14.5s**；依赖清理（assistant-*/lingxi-tools/zip/sha2/base64/uuid/futures/ureq 全删），windows crate 只补回 `Win32_Security`（JobObjects 的 CreateJobObjectW 需要，原先由 Cryptography 传递启用）。
+
+**阶段3 进度实时化**：pet-sync worker 在线时拉 `/activity` 快照，**内容变化才** emit `owo://activity`；前端事件驱动 + 10s 兜底轮询（原 2.5s 盲轮询废弃；隐藏态不受 webview 节流）。
+
+**阶段4 CI**：engine 分支 `engine-release.yml`（`engine-v*` 标签 → 引擎 zip）；desktop 分支 `desktop-release.yml`（`desktop-v*` → 引擎+桌宠 exe 按发布布局打包：exe 旁 ui/pet + ui/assets + owo-agent.exe）。仓库：github.com/3311930677/LingXi-Suite（desktop/engine 双分支）。
+
+**已知边界**：手动直接启动引擎（不经桌宠托管）时需自行设置 `OWO_PET_UI_DIR`/`OWO_PET_ASSETS_DIR`，否则 /pet 404（桌宠场景不受影响——托管时自动注入）；桌宠前端最终视觉效果待用户真机确认。
+
+
 ### 2026-09-30 收尾 5：工作台「每次打开都停在工具页」+ 长页面排版优化
 
 用户反馈两点：① 每次进入工作台都先看到「工作区/自动化」这类页面而不是会话；② 这些页面是一长条往下拉、找不到内容。
